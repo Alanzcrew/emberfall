@@ -1,10 +1,12 @@
-// EMBERFALL screenshot scenes — autopilot staging for ?shot= start/play/levelup/end.
+// EMBERFALL v2 screenshot scenes — autopilot staging for ?shot= start/play/levelup/end.
 // No DOM: stageShot drives the pure world with scripted input and returns the
 // screen the renderer should paint plus the best score to display.
+// v2 autopilot also dashes: when a dasher is winding up or a brute/boss is
+// close, it dashes away from the threat.
 import { SCREEN_TITLE, SCREEN_PLAY, SCREEN_LEVELUP, SCREEN_OVER } from './render.js';
 import { STEP } from './config.js';
 
-const NEUTRAL_INPUT = { mx: 0, my: 0, ax: 1, ay: 0, firing: false };
+const NEUTRAL_INPUT = { mx: 0, my: 0, ax: 1, ay: 0, firing: false, dash: false };
 
 function nearest(list, x, y) {
   let best = null;
@@ -28,10 +30,15 @@ function norm(x, y) {
   return { x: x / len, y: y / len };
 }
 
-// The SPEC autopilot. Normal mode: flee the nearest enemy inside 140px, else
-// chase the nearest gem inside 260px, else drift to the centre; aim at the
-// nearest enemy and fire while any enemy is inside 560px. Weak mode (end
-// scene): no fleeing, always chase gems, fire only inside 200px.
+// The SPEC autopilot, v2 edition. Normal mode: flee the nearest enemy inside
+// 140px, else chase the nearest gem inside 420px, else drift to the centre;
+// aim at the nearest enemy and fire while any enemy is inside 560px. The
+// generous gem radius matters: kills happen at bolt range, so gems land
+// 300-500px out — a 260px chase radius left them uncollected forever and
+// the keeper never levelled up in the play scene. Dash when a dasher is
+// winding up nearby or a big enemy is about to touch us.
+// Weak mode (end scene): no fleeing, always chase gems, fire only inside
+// 200px, never dash.
 function autopilotInput(state, weak) {
   const p = state.player || {};
   const px = p.x == null ? 640 : p.x;
@@ -47,7 +54,7 @@ function autopilotInput(state, weak) {
     const away = norm(px - foe.item.x, py - foe.item.y);
     mx = away.x;
     my = away.y;
-  } else if (gem && (weak || gem.dist < 260)) {
+  } else if (gem && (weak || gem.dist < 420)) {
     const to = norm(gem.item.x - px, gem.item.y - py);
     mx = to.x;
     my = to.y;
@@ -69,9 +76,18 @@ function autopilotInput(state, weak) {
     ay = my;
   }
 
+  // v2 dash logic: dash away when a dasher is winding up within 220px, or
+  // when a brute/boss is inside 70px and our dash is ready.
+  let dash = false;
+  if (!weak && foe && p.dashCooldown <= 0) {
+    const f = foe.item;
+    if (f.type === 'dasher' && f.mode === 'windup' && foe.dist < 220) dash = true;
+    if ((f.type === 'brute' || f.type === 'gloomlord') && foe.dist < 70 + (f.radius || 0)) dash = true;
+  }
+
   const fireRange = weak ? 200 : 560;
   const firing = !!(foe && foe.dist < fireRange);
-  return { mx, my, ax, ay, firing };
+  return { mx, my, ax, ay, firing, dash };
 }
 
 function stepN(world, n, inputFn, attract) {
@@ -89,9 +105,12 @@ export function stageShot(name, world) {
   }
 
   if (name === 'play') {
-    // ~30s of real play. If the autopilot dies early (unlucky surround),
-    // reset and try again so the staged scene is a live fight, not a corpse.
-    const total = Math.round(30 / STEP);
+    // ~35s of real play so the staged fight shows leveled-up combat. If the
+    // autopilot dies early (unlucky surround), reset and try again so the
+    // staged scene is a live fight, not a corpse. After the 35s, keep
+    // stepping until the wave is mid-fight with at least 4 glooms on
+    // screen, so the shot never catches a breather lull.
+    const total = Math.round(35 / STEP);
     for (let attempt = 0; attempt < 3; attempt += 1) {
       world.reset();
       let survived = true;
@@ -105,6 +124,16 @@ export function stageShot(name, world) {
         // stepping while a choice is pending would otherwise freeze here.
         if (world.state.levelUpPending && typeof world.chooseUpgrade === 'function') {
           world.chooseUpgrade(0);
+        }
+      }
+      if (survived) {
+        for (let i = 0; i < Math.round(20 / STEP); i += 1) {
+          if (world.state.waveState === 'fighting' && world.state.enemies.length >= 4) break;
+          world.step(STEP, autopilotInput(world.state, false), false);
+          if (world.state.over) { survived = false; break; }
+          if (world.state.levelUpPending && typeof world.chooseUpgrade === 'function') {
+            world.chooseUpgrade(0);
+          }
         }
       }
       if (survived) break;

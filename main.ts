@@ -1,4 +1,4 @@
-// EMBERFALL — entrypoint for the make.fun best-game-01 bounty (Node 22, stdlib only).
+// EMBERFALL v2 — entrypoint for the make.fun best-game-01 bounty (Node 22, stdlib only).
 // Validates screenshots/ and game/ up front (FAIL FAST), then copies game/ and
 // screenshots/ to the output directory and writes dossier.json with the vendored
 // make.fun library. Run: `node main.ts` (or MAKEFUN_OUTPUT_DIR=out node main.ts).
@@ -21,6 +21,8 @@ function fail(message: string): never {
 }
 
 // ---- FAIL FAST: validate everything BEFORE writing anything to the output dir ----
+// v2 keeps the same gates as v1 (3+ screenshots, each <= 256 KiB, game/index.html
+// present) so a broken hand-in fails here, never in the scorer.
 
 const screenshotsDir = join(here, 'screenshots');
 if (!existsSync(screenshotsDir) || !statSync(screenshotsDir).isDirectory()) {
@@ -68,5 +70,4 @@ writeFileSync(
   }),
 );
 
-console.log(`EMBERFALL handed in: ${images.length} screenshot(s), dossier written to ${join(out, 'dossier.json')}`);
-
+console.log(`EMBERFALL v2 handed in: ${images.length} screenshot(s), dossier written to ${join(out, 'dossier.json')}`);

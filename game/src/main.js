@@ -1,4 +1,6 @@
-// Emberfall boot: ?shot / ?seed handling, fixed-step loop, screen state machine.
+// Emberfall v2 boot: ?shot / ?seed handling, fixed-step loop, screen state machine.
+// v2: dash input (Shift / right-click) is passed into the world each step,
+// and the new v2 events (dash, nova, boss, streak) get their sounds.
 import { STEP, BEST_KEY } from './config.js';
 import { createRandom } from './random.js';
 import {
@@ -12,12 +14,17 @@ import {
   EVENT_HURT,
   EVENT_OVER,
   EVENT_WAVE_START,
+  EVENT_DASH,
+  EVENT_NOVA,
+  EVENT_BOSS,
+  EVENT_STREAK,
 } from './world.js';
 import {
   ACTION_CONFIRM,
   ACTION_PAUSE,
   ACTION_MUTE,
   ACTION_RESTART,
+  ACTION_DASH,
   createInput,
 } from './input.js';
 import {
@@ -69,17 +76,22 @@ function saveBest(score) {
 }
 
 /** Build the per-frame world input from the live input device. */
-function liveInput(input, world) {
+function liveInput(input, world, dashQueued) {
   const mv = input.move();
   const aim = input.aim();
   const p = world.state.player;
   const dx = aim.x - p.x;
   const dy = aim.y - p.y;
   const len = Math.hypot(dx, dy) || 1;
-  return { mx: mv.x, my: mv.y, ax: dx / len, ay: dy / len, firing: input.firing() };
+  return {
+    mx: mv.x, my: mv.y,
+    ax: dx / len, ay: dy / len,
+    firing: input.firing(),
+    dash: dashQueued || input.dashing(),
+  };
 }
 
-const IDLE_INPUT = { mx: 0, my: 0, ax: 1, ay: 0, firing: false };
+const IDLE_INPUT = { mx: 0, my: 0, ax: 1, ay: 0, firing: false, dash: false };
 
 /** Play the sounds that match a step() event bitmask. */
 function playEvents(audio, events, combo) {
@@ -92,6 +104,10 @@ function playEvents(audio, events, combo) {
   if (events & EVENT_HURT) audio.hurt();
   if (events & EVENT_OVER) audio.gameOver();
   if (events & EVENT_WAVE_START) audio.click();
+  if (events & EVENT_DASH) audio.dash();
+  if (events & EVENT_NOVA) audio.nova();
+  if (events & EVENT_BOSS) audio.boss();
+  if (events & EVENT_STREAK) audio.streak();
 }
 
 /**
@@ -108,11 +124,19 @@ function runShot(name) {
   const best = staged && typeof staged.best === 'number' ? staged.best : 0;
 
   announce('Emberfall screenshot: ' + name + '.');
-  renderer.draw(world.state, screen, best);
-  window.requestAnimationFrame(() => {
+  // Paint ~20 frames so the v2 fade-in transition fully settles before the
+  // harness captures; two frames would leave the shot dimmed by the fade.
+  let frames = 0;
+  function paint() {
     renderer.draw(world.state, screen, best);
-    window.__shotReady = true;
-  });
+    frames += 1;
+    if (frames < 20) {
+      window.requestAnimationFrame(paint);
+    } else {
+      window.__shotReady = true;
+    }
+  }
+  window.requestAnimationFrame(paint);
 }
 
 /** Normal interactive game: fixed-step loop + screen state machine. */
@@ -128,6 +152,8 @@ function runGame() {
   let best = loadBest();
   let screen = SCREEN_TITLE;
   let audioReady = false;
+  // One-shot dash requests queue here between frames so a tap is never lost.
+  let dashQueued = false;
 
   function ensureAudio() {
     if (!audioReady) {
@@ -150,7 +176,7 @@ function runGame() {
     world.reset();
     setScreen(
       SCREEN_PLAY,
-      'Emberfall started. Wave 1. Move with WASD, aim with the mouse, hold click or Space to fire.',
+      'Emberfall started. Wave 1. Move with WASD, aim with the mouse, hold click or Space to fire, Shift to dash.',
     );
   }
 
@@ -158,7 +184,7 @@ function runGame() {
     world.reset();
     setScreen(
       SCREEN_PLAY,
-      'Emberfall restarted. Wave 1. Move with WASD, aim with the mouse, hold click or Space to fire.',
+      'Emberfall restarted. Wave 1. Move with WASD, aim with the mouse, hold click or Space to fire, Shift to dash.',
     );
   }
 
@@ -173,6 +199,9 @@ function runGame() {
   function handleActions(actions, click) {
     if (actions & ACTION_MUTE) {
       audio.setMuted(!audio.isMuted());
+    }
+    if (actions & ACTION_DASH) {
+      dashQueued = true;
     }
 
     if (screen === SCREEN_TITLE) {
@@ -268,8 +297,13 @@ function runGame() {
       if (screen === SCREEN_TITLE) {
         world.step(STEP, IDLE_INPUT, true);
       } else if (screen === SCREEN_PLAY) {
-        const events = world.step(STEP, liveInput(input, world), false);
+        const events = world.step(STEP, liveInput(input, world, dashQueued), false);
+        // The dash request is consumed by the first step of the frame.
+        dashQueued = false;
         playEvents(audio, events, world.state.combo);
+        if (events & EVENT_BOSS) {
+          announce('The Gloomlord awakens — wave ' + world.state.wave + '.');
+        }
         if (events & EVENT_LEVELUP) {
           setScreen(
             SCREEN_LEVELUP,

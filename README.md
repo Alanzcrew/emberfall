@@ -1,81 +1,84 @@
-# EMBERFALL — Hold the light. Survive the dark.
+# EMBERFALL v2 — Hold the light. Survive the dark.
 
-[![best-game-01](https://make.fun/badge/best-game-01.svg)](https://make.fun/bounty/best-game-01)
-[![rank](https://make.fun/badge/best-game-01/Alanzcrew/emberfall/rank.svg)](https://make.fun/bounty/best-game-01)
-[![reward](https://make.fun/badge/best-game-01/Alanzcrew/emberfall/reward.svg)](https://make.fun/bounty/best-game-01)
+[![LIVE](https://img.shields.io/badge/LIVE-make.fun-ff9a3c)](https://make.fun/bounty/best-game-01)
+[![GAME](https://img.shields.io/badge/GAME-emberfall-7b5cff)](https://make.fun/bounty/best-game-01)
+[![VERSION](https://img.shields.io/badge/VERSION-v2-ffd166)](https://make.fun/bounty/best-game-01)
 
-A 2D arena-survival roguelite, built with plain canvas 2D — no libraries, no network.
-You are the last lantern-keeper in a dark ember field. Shadow creatures ("glooms")
-swarm in waves. Hold the light, survive the dark, and see how many waves you last.
+A 2D arena-survival roguelite in pure canvas 2D — no libraries, no network.
+You are the last lantern-keeper in a dark ember field. Shadow creatures
+("glooms") swarm in waves. Kill them, gather ember shards, level up, and
+survive the Gloomlord.
 
-Play it on [make.fun](https://make.fun).
+## What's new in v2
 
-## How to play
+- **Dash** (Shift / right-click): a burst of speed with brief invulnerability,
+  on a 2.2s cooldown shown as a ring around the keeper.
+- **Gloomlord boss** every 10th wave: radial orb bursts, wisp summons, and a
+  dedicated boss HP bar.
+- **Dasher** enemies (wave 4+): crouch, telegraph, then lunge at you.
+- **Splitter** enemies (wave 6+): pop into two wisps when killed.
+- **Swarm waves** every 4th wave: fast wisp + dasher floods.
+- **4 new upgrades** (12 total): Ember Nova (radial burst), Orbiting Ember,
+  Kindled Edge (crits), Ember Heart (regen). Combo cap raised to 12.
+- **Kill streaks**: STREAK x5 / RAMPAGE / UNSTOPPABLE announcements.
+- **Run stats** on the game-over screen: accuracy, dashes, nova kills, crits,
+  best combo, bosses slain, time survived.
+- **Polish**: fade transitions between screens, low-HP vignette pulse,
+  owned-upgrade strip, boss bar, richer synth audio (dash whoosh, nova boom,
+  boss sting, bass pulse under the ambient pad).
 
-- **Move:** WASD or arrow keys
-- **Aim:** mouse
-- **Fire:** hold left mouse button or hold Space
-- **Pause:** P or Esc
-- **Mute:** M
-- **Restart:** R
-- **Choose an upgrade:** press 1, 2 or 3, or click a card
+## Controls
 
-Kills drop ember shards (XP). Fill the XP bar to level up and pick 1 of 3 upgrades.
-Every 5th wave a Gloombrute elite spawns — kill it for a big score bonus and a
-healing heart. Chain kills to build your combo multiplier (up to x8) before the
-timer runs out. When your HP hits zero, the run ends — your best score is saved
-locally, so beat it next time.
+- **WASD / Arrows** — move
+- **Mouse** — aim
+- **Hold Click / Space** — fire ember bolts
+- **Shift / Right Click** — dash
+- **1 / 2 / 3 or click** — choose a level-up upgrade
+- **P / Esc** — pause, **M** — mute, **R** — restart
 
-## Features
+## v2 vs v1
 
-- Endless waves with escalating enemy counts, HP and speed
-- Four enemy types: wisps, crawlers, spitters (ranged shadow orbs) and elite
-  Gloombrutes
-- 8 stackable upgrades: fire rate, damage, multi-shot, piercing, move speed,
-  magnet, vitality, bullet range
-- XP shards, combo scoring, wave-clear bonuses, elite heart drops
-- Synthesized WebAudio sound effects and ambient music — no audio files
-- Title, play, level-up, pause and game-over screens; seeded runs for
-  reproducible screenshots
+| | v1 | v2 |
+|---|---|---|
+| Enemy types | 4 (wisp, crawler, spitter, brute) | 7 (+ dasher, splitter, Gloomlord boss) |
+| Upgrades | 8 | 12 (+ nova, orbital, crit, regen) |
+| Movement | walk only | walk + dash with i-frames |
+| Combo cap | 8 | 12, with streak announcements |
+| Waves | brute every 5th | + boss every 10th, swarm every 4th |
+| Game-over screen | score / wave / kills / best | + accuracy, dashes, nova kills, crits, best combo, bosses slain, time |
 
-## Run locally
-
-```sh
-node serve.ts
-```
-
-Then open http://localhost:8080 in a desktop browser. (Use
-`node serve.ts --port 9000` to pick a different port.) No build step and no
-install: the game is plain static files under `game/`.
-
-## Take screenshots
-
-The game supports staged screenshot scenes via URL queries (see `shots.json`):
-
-| File | URL query |
-| --- | --- |
-| 1-start.jpg | `?shot=start&seed=1` |
-| 2-play.jpg | `?shot=play&seed=1` |
-| 3-levelup.jpg | `?shot=levelup&seed=2` |
-| 4-end.jpg | `?shot=end&seed=3` |
-
-Open one of those URLs in a desktop browser at 1280x720, wait for the scene to
-stage, and capture the frame. In normal play you can also press P to pause and
-capture any moment.
-
-## Hand in
+## Run it
 
 ```sh
-node main.ts
+node serve.ts            # serves game/ on http://localhost:8080
 ```
 
-`main.ts` validates `screenshots/` (at least 3 images, each at most 256 KiB) and
-`game/index.html`, then copies `game/` and `screenshots/` to
-`MAKEFUN_OUTPUT_DIR` (default `/output`) and writes `dossier.json`. It fails
-fast with a clear error before writing anything if the screenshots are missing
-or too large.
+Open the page in a desktop browser. No build step, no dependencies.
+
+## Screenshots
+
+`?shot=start&seed=1`, `?shot=play&seed=1`, `?shot=levelup&seed=2`,
+`?shot=end&seed=3` stage the four scenes (see `shots.json`).
+
+## Layout
+
+```
+game/
+  index.html
+  src/
+    config.js    tuning numbers, palette, enemy/boss definitions
+    random.js    seeded mulberry32 RNG
+    input.js     keyboard + mouse (incl. dash)
+    world.js     pure game logic (no DOM) + step()
+    upgrades.js  12 upgrade definitions
+    render.js    canvas renderer, all screens + HUD
+    audio.js     WebAudio synth SFX + ambient music
+    shots.js     autopilot screenshot scenes
+    main.js      boot, fixed-step loop, screen state machine
+main.ts          entrypoint: validates screenshots, writes dossier.json
+serve.ts         static dev server
+```
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
+MIT — see `LICENSE`.

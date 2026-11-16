@@ -1,6 +1,8 @@
-// EMBERFALL audio — WebAudio synth SFX + quiet ambient music. Browser only.
+// EMBERFALL v2 audio — WebAudio synth SFX + quiet ambient music. Browser only.
 // The AudioContext is created lazily in ensure() (first user gesture); every
 // method is a safe no-op before that, and everything is guarded with try/catch.
+// v2 adds dash (whoosh), nova (deep boom), boss (dread sting), streak
+// (rising chime), and a low bass pulse under the ambient pad.
 export function createAudio() {
   let ctx = null;
   let master = null;
@@ -61,6 +63,19 @@ export function createAudio() {
         osc.connect(padGain);
         osc.start();
       }
+      // v2: low bass pulse under the pad, one soft thump per bar.
+      const bassGain = ctx.createGain();
+      bassGain.gain.value = 0.05;
+      const bassFilter = ctx.createBiquadFilter();
+      bassFilter.type = 'lowpass';
+      bassFilter.frequency.value = 220;
+      bassGain.connect(bassFilter);
+      bassFilter.connect(master);
+      const bass = ctx.createOscillator();
+      bass.type = 'sine';
+      bass.frequency.value = 55;
+      bass.connect(bassGain);
+      bass.start();
       // Sparse pentatonic pluck, roughly every 0.45s.
       musicTimer = setInterval(() => {
         try {
@@ -115,7 +130,7 @@ export function createAudio() {
     } catch (err) { /* no-op */ }
   }
 
-  // Brief filtered-noise burst (hit ticks, hurt texture).
+  // Brief filtered-noise burst (hit ticks, hurt texture, dash whoosh).
   function noise(dur, vol, delay, filterFreq) {
     try {
       if (!ctx || !master) return;
@@ -158,7 +173,7 @@ export function createAudio() {
 
   function pickup(combo) {
     // Sine ping rising with the combo (one semitone per combo step, capped).
-    const c = Math.max(0, Math.min(combo || 0, 8));
+    const c = Math.max(0, Math.min(combo || 0, 12));
     const freq = 523.25 * Math.pow(2, c / 12);
     tone('sine', freq, freq * 1.5, 0.14, 0.12);
     // High combos sparkle: a quiet fifth above the ping.
@@ -196,6 +211,35 @@ export function createAudio() {
     tone('sine', 880, 660, 0.04, 0.07);
   }
 
+  // ---- v2 sounds ----
+  function dash() {
+    // Airy whoosh: swept noise + a quick rising sine.
+    noise(0.16, 0.14, 0, 1800);
+    tone('sine', 300, 720, 0.14, 0.07);
+  }
+
+  function nova() {
+    // Deep boom: low sine drop + warm noise bloom.
+    tone('sine', 180, 45, 0.4, 0.2);
+    noise(0.3, 0.1, 0, 900);
+    tone('triangle', 523.25, 784, 0.2, 0.06, 0.02);
+  }
+
+  function boss() {
+    // Dread sting: dissonant low pair, then a slow toll.
+    tone('sawtooth', 98, 92, 0.7, 0.14);
+    tone('sawtooth', 103.83, 98, 0.7, 0.12);
+    tone('triangle', 196, 185, 0.5, 0.1, 0.25);
+  }
+
+  function streak() {
+    // Rising three-note chime for kill streaks.
+    const notes = [659.25, 783.99, 1046.5];
+    for (let i = 0; i < notes.length; i += 1) {
+      tone('sine', notes[i], null, 0.16, 0.12, i * 0.06);
+    }
+  }
+
   function setMuted(m) {
     muted = !!m;
     try {
@@ -220,6 +264,10 @@ export function createAudio() {
     waveClear,
     gameOver,
     click,
+    dash,
+    nova,
+    boss,
+    streak,
     setMuted,
     isMuted,
   };

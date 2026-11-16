@@ -1,13 +1,17 @@
-// EMBERFALL — level-up upgrades. Pure logic, no DOM: safe to import from
+// EMBERFALL v2 — level-up upgrades. Pure logic, no DOM: safe to import from
 // Node. The player's live numbers live in a stats object shaped like the one
 // baseStats() returns; applyUpgrade() mutates that object in place.
+// v2 grows the pool from 8 to 12: nova (radial burst), orbital (orbiting
+// ember), crit (critical hits) and regen (HP per second) join the v1 eight.
 
 import { PLAYER } from './config.js';
 
 /**
  * A fresh stats object with the run's default values (copied from config).
  * Shape: { fireRate, damage, projectiles, pierce, speed, magnet, maxHp,
- * bulletSpeed, bulletRange }.
+ * bulletSpeed, bulletRange, nova, orbital, critChance, regen }.
+ * nova/orbital are stack counts (0 = not taken); critChance is 0..1;
+ * regen is HP per second.
  */
 export function baseStats() {
   return {
@@ -20,6 +24,10 @@ export function baseStats() {
     maxHp: PLAYER.maxHp,
     bulletSpeed: PLAYER.bulletSpeed,
     bulletRange: PLAYER.bulletRange,
+    nova: 0,
+    orbital: 0,
+    critChance: 0,
+    regen: 0,
   };
 }
 
@@ -55,8 +63,6 @@ export const UPGRADE_DEFS = [
     max: 5,
     apply(stats) { stats.pierce += 1; },
   },
-];
-UPGRADE_DEFS.push(
   {
     id: 'swift',
     name: 'Swift Boots',
@@ -85,7 +91,36 @@ UPGRADE_DEFS.push(
     max: 5,
     apply(stats) { stats.bulletSpeed *= 1.15; stats.bulletRange *= 1.15; },
   },
-);
+  // ---- v2 additions ----
+  {
+    id: 'nova',
+    name: 'Ember Nova',
+    desc: 'Radial burst every few seconds, hurts all nearby glooms',
+    max: 5,
+    apply(stats) { stats.nova += 1; },
+  },
+  {
+    id: 'orbital',
+    name: 'Orbiting Ember',
+    desc: '+1 ember orbiting you, burning glooms it touches',
+    max: 4,
+    apply(stats) { stats.orbital += 1; },
+  },
+  {
+    id: 'crit',
+    name: 'Kindled Edge',
+    desc: '+12% critical chance — crits deal double damage',
+    max: 5,
+    apply(stats) { stats.critChance = Math.min(0.6, stats.critChance + 0.12); },
+  },
+  {
+    id: 'regen',
+    name: 'Ember Heart',
+    desc: 'Regenerate +0.8 HP per second',
+    max: 5,
+    apply(stats) { stats.regen += 0.8; },
+  },
+];
 
 /**
  * Roll 3 distinct upgrades the player can still take.

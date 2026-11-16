@@ -1,4 +1,6 @@
-// Seeded RNG for Emberfall: mulberry32.
+// Seeded RNG for Emberfall v2: mulberry32. Unchanged from v1 — the same
+// seed must always produce the same sequence, which is what makes ?seed
+// replays stable across versions.
 /**
  * Create a deterministic mulberry32 PRNG from a 32-bit seed.
  * Returns a function next() -> float in [0, 1). The same seed always
@@ -19,7 +21,8 @@ export function createRandom(seed) {
   }
 
   // Convenience helpers on the generator itself; world/shots may use them,
-  // but the plain next() call is the only contract.
+  // but the plain next() call is the only contract. v2 keeps this module
+  // byte-identical in behaviour to v1 so old seeds replay the same way.
   next.int = (n) => Math.floor(next() * n);
   next.range = (min, max) => min + next() * (max - min);
   next.pick = (arr) => arr[Math.floor(next() * arr.length)];

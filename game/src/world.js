@@ -1,14 +1,22 @@
-// EMBERFALL — pure game logic. No window, document, or canvas anywhere in
-// this file: it runs identically in the browser and in Node, and given the
+// EMBERFALL v2 — pure game logic. No window, document, or canvas anywhere
+// in this file: it runs identically in the browser and in Node, and given the
 // same seeded random it plays out deterministically.
+//
+// v2 adds: dasher + splitter enemies, the Gloomlord boss every 10th wave,
+// swarm waves every 4th wave, a dash move with i-frames, nova / orbital /
+// crit / regen upgrades, kill-streak announcements, and per-run stats.
 //
 // World interface:
 //   createWorld(random) -> { state, reset(), step(dt, input, attract),
 //                            chooseUpgrade(index) }
-//   input = { mx, my, ax, ay, firing } — move -1..1, aim dir normalized,
-//           firing bool. step() returns an events bitmask.
+//   input = { mx, my, ax, ay, firing, dash } — move -1..1, aim dir
+//           normalized, firing bool, dash bool (one-shot request).
+//   step() returns an events bitmask.
 
-import { FIELD, PLAYER, ENEMY, WAVE, XP, COMBO, GEM, HEART } from './config.js';
+import {
+  FIELD, PLAYER, ENEMY, WAVE, XP, COMBO, GEM, HEART,
+  NOVA, ORBITAL, CRIT,
+} from './config.js';
 import { rollUpgrades, applyUpgrade, baseStats } from './upgrades.js';
 
 // Event bitmask returned by step(). main.js turns these into sounds.
@@ -21,6 +29,10 @@ export const EVENT_WAVE_CLEAR = 32;
 export const EVENT_HURT = 64;
 export const EVENT_OVER = 128;
 export const EVENT_WAVE_START = 256;
+export const EVENT_DASH = 512;
+export const EVENT_NOVA = 1024;
+export const EVENT_BOSS = 2048;
+export const EVENT_STREAK = 4096;
 
 // ---------------------------------------------------------------------------
 // Small helpers (all pure, all driven by the seeded random where chance is
@@ -100,6 +112,8 @@ function makeState(random) {
     gems: [],
     particles: [],
     texts: [],
+    orbiters: [], // v2: orbiting ember positions, computed each step
+    boss: null, // v2: live Gloomlord enemy, or null
     player: {
       x: FIELD.width / 2,
       y: FIELD.height / 2,
@@ -115,6 +129,14 @@ function makeState(random) {
       invuln: 0,
       aimX: 1,
       aimY: 0,
+      // v2 dash state.
+      dashCooldown: 0,
+      dashTime: 0,
+      dashDirX: 1,
+      dashDirY: 0,
+      novaTimer: 0,
+      orbitAngle: 0,
+      regenAcc: 0,
     },
     owned: {},
     score: 0,
@@ -126,6 +148,16 @@ function makeState(random) {
     choices: [],
     over: false,
     best: 0,
+    // v2: per-run stats shown on the game-over screen.
+    runStats: {
+      shots: 0,
+      hits: 0,
+      dashes: 0,
+      novaKills: 0,
+      crits: 0,
+      bestCombo: 1,
+      bossKills: 0,
+    },
     emberDots: makeEmberDots(random),
   };
 }
@@ -193,13 +225,24 @@ export function createWorld(random) {
     }
   }
 
-  function killEnemy(enemy) {
-    // Score uses the current combo, then the combo climbs (cap 8).
+  function dropGem(x, y, value, kind) {
+    const angle = random() * Math.PI * 2;
+    state.gems.push({
+      x, y,
+      vx: Math.cos(angle) * 60, vy: Math.sin(angle) * 60,
+      value, kind,
+    });
+  }
+
+  function killEnemy(enemy, byNova) {
+    // Score uses the current combo, then the combo climbs (cap 12 in v2).
     const gained = enemy.score * state.combo;
     state.score += gained;
     state.kills += 1;
     state.combo = Math.min(state.combo + 1, COMBO.cap);
     state.comboTimer = COMBO.timer;
+    if (state.combo > state.runStats.bestCombo) state.runStats.bestCombo = state.combo;
+    if (byNova) state.runStats.novaKills += 1;
     pendingEvents |= EVENT_KILL;
     addText(enemy.x, enemy.y - enemy.radius - 6, `+${gained}`, '#ffd166', 15);
     burst(enemy.x, enemy.y, '#b8a9ff', 12, 240, 0.5, 3);
@@ -208,24 +251,57 @@ export function createWorld(random) {
       state.shake = Math.max(state.shake, 12);
       ring(enemy.x, enemy.y, '#ff9a3c', 120);
     }
-    // Drops: one ember shard worth the enemy's xp, plus a heart roll.
-    const angle = random() * Math.PI * 2;
-    state.gems.push({
-      x: enemy.x, y: enemy.y,
-      vx: Math.cos(angle) * 60, vy: Math.sin(angle) * 60,
-      value: enemy.xp, kind: 'gem',
-    });
-    const heartChance = enemy.type === 'brute'
-      ? 1
-      : (enemy.type === 'crawler' || enemy.type === 'spitter' ? HEART.dropChance : 0);
-    if (heartChance > 0 && random() < heartChance) {
-      const ha = random() * Math.PI * 2;
-      state.gems.push({
-        x: enemy.x, y: enemy.y,
-        vx: Math.cos(ha) * 50, vy: Math.sin(ha) * 50,
-        value: HEART.heal, kind: 'heart',
-      });
+    if (enemy.type === 'gloomlord') {
+      // Boss down: big celebration, three hearts, and a score shower.
+      state.shake = Math.max(state.shake, 18);
+      ring(enemy.x, enemy.y, '#ff3d6e', 220);
+      ring(enemy.x, enemy.y, '#ffd166', 160);
+      burst(enemy.x, enemy.y, '#ff3d6e', 40, 340, 1.0, 4);
+      burst(enemy.x, enemy.y, '#ffd166', 30, 260, 1.2, 3);
+      addText(enemy.x, enemy.y - 70, 'GLOOMLORD SLAIN!', '#ffd166', 26);
+      state.runStats.bossKills += 1;
+      state.boss = null;
+      for (let i = 0; i < 3; i++) dropGem(enemy.x, enemy.y, HEART.heal, 'heart');
     }
+    if (enemy.type === 'splitter') {
+      // Splits into two fresh wisps that pop in with a short telegraph.
+      for (let i = 0; i < ENEMY.splitter.children; i++) {
+        const a = random() * Math.PI * 2;
+        const def = ENEMY.wisp;
+        state.enemies.push({
+          type: 'wisp',
+          x: clamp(enemy.x + Math.cos(a) * 26, 12, FIELD.width - 12),
+          y: clamp(enemy.y + Math.sin(a) * 26, 12, FIELD.height - 12),
+          vx: 0, vy: 0,
+          radius: def.radius, hp: def.hp, maxHp: def.hp,
+          speed: def.speed, dmg: def.dmg, xp: def.xp, score: def.score,
+          telegraph: 0.35, phase: random() * Math.PI * 2,
+          orbTimer: 0, flash: 0, mode: 'chase', modeTimer: 0,
+        });
+      }
+      burst(enemy.x, enemy.y, '#b8a9ff', 10, 200, 0.5, 3);
+    }
+    // Kill-streak announcements at combo milestones.
+    if (state.combo === 5 || state.combo === 8 || state.combo === 12) {
+      const label = state.combo === 12 ? 'UNSTOPPABLE!' : state.combo === 8 ? 'RAMPAGE!' : 'STREAK x5!';
+      addText(state.player.x, state.player.y - 64, label, '#ffe066', 24);
+      pendingEvents |= EVENT_STREAK;
+    }
+    // Drops: one ember shard worth the enemy's xp, plus a heart roll.
+    dropGem(enemy.x, enemy.y, enemy.xp, 'gem');
+    const heartChance = enemy.type === 'brute' || enemy.type === 'gloomlord'
+      ? 1
+      : (enemy.type === 'crawler' || enemy.type === 'spitter' || enemy.type === 'splitter'
+        ? HEART.dropChance : 0);
+    if (heartChance > 0 && random() < heartChance) {
+      dropGem(enemy.x, enemy.y, HEART.heal, 'heart');
+    }
+  }
+
+  function damageEnemy(enemy, dmg, byNova) {
+    enemy.hp -= dmg;
+    enemy.flash = 0.12;
+    if (enemy.hp <= 0) killEnemy(enemy, byNova);
   }
 
   function levelUpOnce() {
@@ -250,18 +326,20 @@ export function createWorld(random) {
   // Spawning + waves.
   // -------------------------------------------------------------------------
 
-  function spawnEnemy(type) {
+  function spawnEnemy(type, atX, atY) {
     const p = state.player;
     const def = ENEMY[type];
-    const pos = pickSpawnPoint(random, p.x, p.y);
+    const pos = (atX != null && atY != null)
+      ? { x: atX, y: atY }
+      : pickSpawnPoint(random, p.x, p.y);
     const hpScale = 1 + WAVE.hpScale * (state.wave - 1);
     const speedScale = Math.min(1 + WAVE.speedScale * (state.wave - 1), WAVE.speedScaleCap);
-    state.enemies.push({
+    const hp = Math.max(1, Math.round(def.hp * hpScale));
+    const enemy = {
       type,
       x: pos.x, y: pos.y, vx: 0, vy: 0,
       radius: def.radius,
-      hp: Math.max(1, Math.round(def.hp * hpScale)),
-      maxHp: Math.max(1, Math.round(def.hp * hpScale)),
+      hp, maxHp: hp,
       speed: def.speed * speedScale,
       dmg: def.dmg,
       xp: def.xp,
@@ -270,18 +348,51 @@ export function createWorld(random) {
       phase: random() * Math.PI * 2,
       orbTimer: 1 + random() * 1.2,
       flash: 0,
-    });
+      // v2 AI state: dasher mode machine, boss timers, orbital hit guard.
+      mode: 'chase',
+      modeTimer: 0,
+      lungeX: 0,
+      lungeY: 0,
+      burstTimer: ENEMY.gloomlord.burstInterval,
+      summonTimer: ENEMY.gloomlord.summonInterval,
+      orbCooldown: 0,
+    };
+    state.enemies.push(enemy);
+    if (type === 'gloomlord') {
+      state.boss = enemy;
+      pendingEvents |= EVENT_BOSS;
+      addText(FIELD.width / 2, 150, 'THE GLOOMLORD AWAKENS', '#ff3d6e', 30);
+      state.shake = Math.max(state.shake, 10);
+    }
+    return enemy;
+  }
+
+  function isSwarmWave(wave) {
+    return wave % WAVE.swarmEvery === 0 && wave % WAVE.bossEvery !== 0;
   }
 
   function setupWave() {
-    // Spend the wave budget on a shuffled queue: wisps always, crawlers from
-    // wave 2, spitters from wave 3. A brute leads waves 5, 10, 15, ...
+    // Spend the wave budget on a shuffled queue. Unlocks: crawlers wave 2,
+    // spitters wave 3, dashers wave 4, splitters wave 6. A brute leads waves
+    // 5, 10, 15, ... and a Gloomlord rules every 10th wave. Every 4th wave
+    // is a fast wisp/dasher swarm with a fatter budget.
     let budget = WAVE.budgetBase + state.wave * WAVE.budgetPerWave;
+    if (isSwarmWave(state.wave)) budget = Math.round(budget * WAVE.swarmBudgetMult);
     const queue = [];
     while (budget > 0) {
       const options = [{ type: 'wisp', cost: ENEMY.wisp.cost, weight: 5 }];
-      if (state.wave >= 2) options.push({ type: 'crawler', cost: ENEMY.crawler.cost, weight: 3 });
-      if (state.wave >= 3) options.push({ type: 'spitter', cost: ENEMY.spitter.cost, weight: 2 });
+      if (state.wave >= 2 && !isSwarmWave(state.wave)) {
+        options.push({ type: 'crawler', cost: ENEMY.crawler.cost, weight: 3 });
+      }
+      if (state.wave >= 3 && !isSwarmWave(state.wave)) {
+        options.push({ type: 'spitter', cost: ENEMY.spitter.cost, weight: 2 });
+      }
+      if (state.wave >= 4) {
+        options.push({ type: 'dasher', cost: ENEMY.dasher.cost, weight: isSwarmWave(state.wave) ? 3 : 2 });
+      }
+      if (state.wave >= 6 && !isSwarmWave(state.wave)) {
+        options.push({ type: 'splitter', cost: ENEMY.splitter.cost, weight: 2 });
+      }
       const affordable = options.filter((o) => o.cost <= budget);
       let total = 0;
       for (const o of affordable) total += o.weight;
@@ -302,6 +413,7 @@ export function createWorld(random) {
       queue[j] = tmp;
     }
     if (state.wave % WAVE.bruteEvery === 0) queue.unshift('brute');
+    if (state.wave % WAVE.bossEvery === 0) queue.unshift('gloomlord');
     state.spawnQueue = queue;
   }
 
@@ -337,9 +449,14 @@ export function createWorld(random) {
     const p = state.player;
     if (p.invuln > 0) p.invuln -= dt;
     if (p.fireCooldown > 0) p.fireCooldown -= dt;
+    if (p.dashCooldown > 0) p.dashCooldown -= dt;
     if (state.comboTimer > 0) {
       state.comboTimer -= dt;
       if (state.comboTimer <= 0) state.combo = 1;
+    }
+    // v2 regen: slow HP trickle while the run lasts.
+    if (p.stats.regen > 0 && p.hp > 0 && p.hp < p.maxHp) {
+      p.hp = Math.min(p.maxHp, p.hp + p.stats.regen * dt);
     }
 
     // Aim follows the input direction; a zero vector keeps the last aim.
@@ -349,13 +466,40 @@ export function createWorld(random) {
       p.aimY = input.ay / len;
     }
 
-    // Snappy accel/decel: velocity chases the target quickly, so movement
-    // feels responsive without being instant.
-    const ACCEL = 2600;
-    const tx = (input.mx || 0) * p.stats.speed;
-    const ty = (input.my || 0) * p.stats.speed;
-    p.vx += clamp(tx - p.vx, -ACCEL * dt, ACCEL * dt);
-    p.vy += clamp(ty - p.vy, -ACCEL * dt, ACCEL * dt);
+    // v2 dash: burst in the move direction (or aim if standing still),
+    // with i-frames and an ember trail. One-shot: input.dash is consumed
+    // here and the cooldown gates the next one.
+    if (input.dash && p.dashCooldown <= 0 && p.dashTime <= 0) {
+      let dx = input.mx || 0;
+      let dy = input.my || 0;
+      if (dx === 0 && dy === 0) { dx = p.aimX; dy = p.aimY; }
+      const len = Math.hypot(dx, dy) || 1;
+      p.dashDirX = dx / len;
+      p.dashDirY = dy / len;
+      p.dashTime = PLAYER.dashTime;
+      p.dashCooldown = PLAYER.dashCooldown;
+      p.invuln = Math.max(p.invuln, PLAYER.dashInvuln);
+      state.runStats.dashes += 1;
+      pendingEvents |= EVENT_DASH;
+      burst(p.x, p.y, '#7de3ff', 8, 180, 0.35, 2.5);
+    }
+
+    if (p.dashTime > 0) {
+      // Dashing: fixed burst velocity, trail embers behind.
+      p.dashTime -= dt;
+      p.vx = p.dashDirX * PLAYER.dashSpeed;
+      p.vy = p.dashDirY * PLAYER.dashSpeed;
+      addParticle(p.x, p.y, -p.dashDirX * 60, -p.dashDirY * 60,
+        0.3, 4, '#ff9a3c', 'ember');
+    } else {
+      // Snappy accel/decel: velocity chases the target quickly, so movement
+      // feels responsive without being instant.
+      const ACCEL = 2600;
+      const tx = (input.mx || 0) * p.stats.speed;
+      const ty = (input.my || 0) * p.stats.speed;
+      p.vx += clamp(tx - p.vx, -ACCEL * dt, ACCEL * dt);
+      p.vy += clamp(ty - p.vy, -ACCEL * dt, ACCEL * dt);
+    }
     p.x = clamp(p.x + p.vx * dt, PLAYER.radius, FIELD.width - PLAYER.radius);
     p.y = clamp(p.y + p.vy * dt, PLAYER.radius, FIELD.height - PLAYER.radius);
 
@@ -379,9 +523,57 @@ export function createWorld(random) {
           hitIds: new Set(),
         });
       }
+      state.runStats.shots += n;
       p.fireCooldown = 1 / p.stats.fireRate;
       pendingEvents |= EVENT_SHOOT;
       burst(p.x + p.aimX * 22, p.y + p.aimY * 22, '#ff9a3c', 2, 90, 0.18, 2);
+    }
+
+    // v2 nova: periodic radial burst, stronger per stack.
+    if (p.stats.nova > 0) {
+      p.novaTimer -= dt;
+      if (p.novaTimer <= 0) {
+        const stacks = p.stats.nova;
+        const radius = NOVA.radius + (stacks - 1) * 14;
+        const dmg = NOVA.damage + (stacks - 1);
+        p.novaTimer = Math.max(
+          NOVA.minInterval,
+          NOVA.interval - (stacks - 1) * NOVA.intervalPerStack,
+        );
+        pendingEvents |= EVENT_NOVA;
+        ring(p.x, p.y, '#ff9a3c', radius);
+        burst(p.x, p.y, '#ff9a3c', 18, 300, 0.5, 3);
+        for (const e of state.enemies) {
+          if (e.telegraph > 0 || e.hp <= 0) continue;
+          if (dist(e.x, e.y, p.x, p.y) < radius + e.radius) {
+            damageEnemy(e, dmg, true);
+          }
+        }
+      }
+    }
+
+    // v2 orbital: embers circle the keeper and burn what they touch.
+    if (p.stats.orbital > 0) {
+      p.orbitAngle += ORBITAL.speed * dt;
+      const n = p.stats.orbital * ORBITAL.countPerStack;
+      const dmg = ORBITAL.damage + (p.stats.orbital - 1);
+      state.orbiters = [];
+      for (let i = 0; i < n; i++) {
+        const a = p.orbitAngle + (i * Math.PI * 2) / n;
+        const ox = p.x + Math.cos(a) * ORBITAL.radius;
+        const oy = p.y + Math.sin(a) * ORBITAL.radius;
+        state.orbiters.push({ x: ox, y: oy, angle: a });
+        for (const e of state.enemies) {
+          if (e.telegraph > 0 || e.hp <= 0 || e.orbCooldown > 0) continue;
+          if (dist(ox, oy, e.x, e.y) < 12 + e.radius) {
+            e.orbCooldown = ORBITAL.hitCooldown;
+            damageEnemy(e, dmg, false);
+            burst(ox, oy, '#ffb347', 4, 140, 0.3, 2.5);
+          }
+        }
+      }
+    } else {
+      state.orbiters = [];
     }
   }
 
@@ -399,12 +591,25 @@ export function createWorld(random) {
         for (const e of state.enemies) {
           if (e.telegraph > 0 || e.hp <= 0 || b.hitIds.has(e)) continue;
           if (dist(b.x, b.y, e.x, e.y) < b.radius + e.radius) {
-            e.hp -= b.damage;
-            e.flash = 0.12;
+            // v2 crit: seeded roll, double damage, gold text.
+            let dmg = b.damage;
+            let crit = false;
+            if (state.player.stats.critChance > 0
+              && random() < state.player.stats.critChance) {
+              dmg *= CRIT.multiplier;
+              crit = true;
+              state.runStats.crits += 1;
+            }
+            damageEnemy(e, dmg, false);
+            state.runStats.hits += 1;
             b.hitIds.add(e);
             pendingEvents |= EVENT_HIT;
-            burst(b.x, b.y, '#ffd166', 4, 160, 0.25, 2.5);
-            if (e.hp <= 0) killEnemy(e);
+            if (crit) {
+              addText(b.x, b.y - 10, `CRIT ${dmg}`, '#ffe066', 16);
+              burst(b.x, b.y, '#ffe066', 5, 180, 0.3, 2.5);
+            } else {
+              burst(b.x, b.y, '#ffd166', 4, 160, 0.25, 2.5);
+            }
             if (b.pierce > 0) {
               b.pierce -= 1;
             } else {
@@ -446,6 +651,7 @@ export function createWorld(random) {
     for (const e of state.enemies) {
       if (e.telegraph > 0) { e.telegraph -= dt; continue; }
       if (e.flash > 0) e.flash -= dt;
+      if (e.orbCooldown > 0) e.orbCooldown -= dt;
       const dx = p.x - e.x;
       const dy = p.y - e.y;
       const d = Math.hypot(dx, dy) || 1;
@@ -481,8 +687,79 @@ export function createWorld(random) {
           e.orbTimer = def.orbInterval;
           burst(e.x, e.y, '#7b5cff', 4, 120, 0.3, 2.5);
         }
+      } else if (e.type === 'dasher') {
+        // v2: crouch (telegraphed), lunge, recover, repeat.
+        const def = ENEMY.dasher;
+        if (e.mode === 'chase') {
+          mvx = nx * e.speed;
+          mvy = ny * e.speed;
+          e.modeTimer -= dt;
+          if (d < 280 && e.modeTimer <= 0) {
+            e.mode = 'windup';
+            e.modeTimer = def.windup;
+            e.lungeX = nx;
+            e.lungeY = ny;
+          }
+        } else if (e.mode === 'windup') {
+          // Crouch in place, visibly tensing (renderer draws it pulled in).
+          mvx = 0;
+          mvy = 0;
+          e.modeTimer -= dt;
+          if (e.modeTimer <= 0) {
+            // Re-aim at the keeper's current position: the lunge tracks a
+            // little, so standing still through the windup gets punished.
+            e.lungeX = nx;
+            e.lungeY = ny;
+            e.mode = 'lunge';
+            e.modeTimer = def.lungeTime;
+          }
+        } else if (e.mode === 'lunge') {
+          mvx = e.lungeX * def.lungeSpeed;
+          mvy = e.lungeY * def.lungeSpeed;
+          e.modeTimer -= dt;
+          if (e.modeTimer <= 0) {
+            e.mode = 'recover';
+            e.modeTimer = def.lungeCooldown;
+          }
+        } else {
+          // recover: drift slowly, then chase again.
+          mvx = nx * e.speed * 0.4;
+          mvy = ny * e.speed * 0.4;
+          e.modeTimer -= dt;
+          if (e.modeTimer <= 0) e.mode = 'chase';
+        }
+      } else if (e.type === 'gloomlord') {
+        // v2 boss: slow chase, radial orb bursts, wisp summons.
+        mvx = nx * e.speed;
+        mvy = ny * e.speed;
+        const def = ENEMY.gloomlord;
+        e.burstTimer -= dt;
+        if (e.burstTimer <= 0) {
+          e.burstTimer = def.burstInterval;
+          for (let i = 0; i < def.burstCount; i++) {
+            const a = (i / def.burstCount) * Math.PI * 2 + e.phase;
+            state.enemyBullets.push({
+              x: e.x, y: e.y,
+              vx: Math.cos(a) * def.orbSpeed, vy: Math.sin(a) * def.orbSpeed,
+              radius: 8, dmg: def.orbDamage, life: 8,
+            });
+          }
+          ring(e.x, e.y, '#ff3d6e', 90);
+          state.shake = Math.max(state.shake, 5);
+        }
+        e.summonTimer -= dt;
+        if (e.summonTimer <= 0) {
+          e.summonTimer = def.summonInterval;
+          for (let i = 0; i < def.summonCount; i++) {
+            const a = random() * Math.PI * 2;
+            spawnEnemy('wisp',
+              clamp(e.x + Math.cos(a) * 90, 12, FIELD.width - 12),
+              clamp(e.y + Math.sin(a) * 90, 12, FIELD.height - 12));
+          }
+          burst(e.x, e.y, '#7b5cff', 12, 200, 0.5, 3);
+        }
       } else {
-        // Crawler and brute: steady chase.
+        // Crawler, splitter and brute: steady chase.
         mvx = nx * e.speed;
         mvy = ny * e.speed;
       }
@@ -611,7 +888,8 @@ export function createWorld(random) {
         radius: def.radius, hp: def.hp, maxHp: def.hp,
         speed: 40, dmg: 0, xp: def.xp, score: def.score,
         telegraph: 0, phase: random() * Math.PI * 2,
-        orbTimer: 0, flash: 0,
+        orbTimer: 0, flash: 0, mode: 'chase', modeTimer: 0,
+        burstTimer: 0, summonTimer: 0, orbCooldown: 0,
       });
     }
     for (const e of state.enemies) {
@@ -652,7 +930,7 @@ export function createWorld(random) {
       return pendingEvents;
     }
 
-    updatePlayer(safeDt, input || { mx: 0, my: 0, ax: 1, ay: 0, firing: false });
+    updatePlayer(safeDt, input || { mx: 0, my: 0, ax: 1, ay: 0, firing: false, dash: false });
     updateBullets(safeDt);
     updateEnemyBullets(safeDt);
     updateEnemies(safeDt);
@@ -673,6 +951,10 @@ export function createWorld(random) {
       // Vitality also heals: maxHp grew inside applyUpgrade, sync and heal.
       p.maxHp = p.stats.maxHp;
       p.hp = Math.min(p.maxHp, p.hp + 25);
+    }
+    if (choice.id === 'nova') {
+      // First nova stack fires soon so the player sees it right away.
+      p.novaTimer = Math.min(p.novaTimer, 1.2);
     }
     state.levelUpPending = false;
     state.choices = [];

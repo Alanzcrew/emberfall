@@ -1,12 +1,17 @@
-// Keyboard + mouse input for Emberfall. Held keys steer; one-shot presses
-// (confirm, pause, mute, restart) are queued as bit flags and taken once.
+// Keyboard + mouse input for Emberfall v2. Held keys steer; one-shot presses
+// (confirm, pause, mute, restart, dash) are queued as bit flags and taken once.
+// v2 adds the dash: Shift (either side) or right mouse button. Dashing is a
+// one-shot action so a held Shift cannot chain-dash through the cooldown.
 export const ACTION_CONFIRM = 1;
 export const ACTION_PAUSE = 2;
 export const ACTION_MUTE = 4;
 export const ACTION_RESTART = 8;
+export const ACTION_DASH = 16;
 
 const FIELD_WIDTH = 1280;
 const FIELD_HEIGHT = 720;
+// Dash on Shift (either side) or right mouse button; Space stays fire-only
+// so a firing keeper never dashes by accident.
 
 const LEFT = new Set(['ArrowLeft', 'KeyA']);
 const RIGHT = new Set(['ArrowRight', 'KeyD']);
@@ -16,6 +21,7 @@ const CONFIRM = new Set(['Space', 'Enter']);
 const PAUSE = new Set(['KeyP', 'Escape']);
 const MUTE = new Set(['KeyM']);
 const RESTART = new Set(['KeyR']);
+const DASH_KEYS = new Set(['ShiftLeft', 'ShiftRight']);
 const DIGITS = { Digit1: 1, Digit2: 2, Digit3: 3 };
 // Keys whose default browser behaviour (scrolling, etc.) must be suppressed.
 const PREVENT = new Set([
@@ -31,6 +37,7 @@ const PREVENT = new Set([
  *   move: () => {x:number, y:number},
  *   aim: () => {x:number, y:number},
  *   firing: () => boolean,
+ *   dashing: () => boolean,
  *   takeActions: () => number,
  *   takeClick: () => {x:number, y:number} | null,
  *   takeDigit: () => 0|1|2|3
@@ -62,6 +69,7 @@ export function createInput(canvas) {
     else if (PAUSE.has(event.code)) actions |= ACTION_PAUSE;
     else if (MUTE.has(event.code)) actions |= ACTION_MUTE;
     else if (RESTART.has(event.code)) actions |= ACTION_RESTART;
+    else if (DASH_KEYS.has(event.code)) actions |= ACTION_DASH;
     else if (DIGITS[event.code]) digit = DIGITS[event.code];
   });
 
@@ -82,6 +90,11 @@ export function createInput(canvas) {
 
   canvas.addEventListener('pointerdown', (event) => {
     mouse = toLogical(event.clientX, event.clientY);
+    if (event.button === 2) {
+      // Right click = dash, not fire.
+      actions |= ACTION_DASH;
+      return;
+    }
     mouseDown = true;
     click = { x: mouse.x, y: mouse.y };
     // Focus the canvas so keyboard input keeps working after a click.
@@ -123,9 +136,14 @@ export function createInput(canvas) {
       return { x: mouse.x, y: mouse.y };
     },
 
-    /** True while the mouse button is held or Space is held down. */
+    /** True while the left mouse button is held or Space is held down. */
     firing() {
       return mouseDown || held.has('Space');
+    },
+
+    /** True while a dash key is held (held-dash also works, via actions). */
+    dashing() {
+      return held.has('ShiftLeft') || held.has('ShiftRight');
     },
 
     /** The one-shot ACTION_* presses since the last call (consumed). */

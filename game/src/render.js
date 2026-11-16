@@ -1,7 +1,10 @@
-// EMBERFALL renderer — canvas 2D, all screens + HUD.
+// EMBERFALL v2 renderer — canvas 2D, all screens + HUD.
 // Top-level is DOM-free (only createRenderer touches the canvas) so Node can
 // import this module for its screen constants.
-import { FIELD, PALETTE, FONT } from './config.js';
+// v2 adds: boss HP bar, dash-cooldown ring around the keeper, owned-upgrade
+// strip, low-HP vignette pulse, fade transitions between screens, and art
+// for the dasher, splitter and Gloomlord boss.
+import { FIELD, PALETTE, FONT, PLAYER } from './config.js';
 
 export const SCREEN_TITLE = 'title';
 export const SCREEN_PLAY = 'play';
@@ -136,6 +139,31 @@ function drawPlayer(ctx, state) {
 
   drawLanternLight(ctx, p);
 
+  // v2: dash-cooldown ring under the keeper — fills as the dash recharges.
+  if (p.dashCooldown > 0) {
+    const frac = 1 - clamp(p.dashCooldown / PLAYER.dashCooldown, 0, 1);
+    ctx.save();
+    ctx.strokeStyle = PALETTE.dash;
+    ctx.globalAlpha = 0.75;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, PLAYER_R + 9, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  } else if (p.dashTime > 0) {
+    // Mid-dash: bright cyan afterimage ring.
+    ctx.save();
+    ctx.strokeStyle = PALETTE.dash;
+    ctx.globalAlpha = 0.9;
+    ctx.shadowColor = PALETTE.dash;
+    ctx.shadowBlur = 14;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, PLAYER_R + 9, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
   // Flicker while invulnerable after a hit.
   let alpha = 1;
   if (p.invuln > 0) alpha = 0.45 + 0.35 * Math.sin(t * 30);
@@ -196,14 +224,13 @@ function drawPlayer(ctx, state) {
 
 function drawEnemy(ctx, e, t) {
   if (!e || e.x == null) return;
-  const r = e.r || 12;
+  const r = e.r || e.radius || 12;
   const type = e.type || 'wisp';
   const hp = e.hp == null ? 1 : e.hp;
   const maxHp = e.maxHp == null ? hp : e.maxHp;
 
   // Spawn telegraph: expanding dashed ring while the gloom materialises.
-  // Worlds may signal it with a telegraph fraction or with active === false.
-  const telegraph = e.telegraph != null ? e.telegraph : (e.active === false ? 0.6 : 0);
+  const telegraph = e.telegraph != null ? e.telegraph : 0;
   if (telegraph > 0) {
     ctx.save();
     ctx.strokeStyle = PALETTE.shadow;
@@ -217,648 +244,592 @@ function drawEnemy(ctx, e, t) {
   }
 
   ctx.save();
-  // Shadow blob body.
-  const body = ctx.createRadialGradient(e.x - r * 0.3, e.y - r * 0.35, r * 0.1, e.x, e.y, r * 1.15);
-  body.addColorStop(0, '#4b3a8f');
-  body.addColorStop(0.6, '#241a4d');
-  body.addColorStop(1, '#0d091f');
-  ctx.fillStyle = body;
-  ctx.shadowColor = PALETTE.shadow;
-  ctx.shadowBlur = 14;
+  // Shadow blob body. Dasher crouches (smaller, brighter) while winding up.
+  let bodyR = r;
+  let bodyColor = PALETTE.shadow;
+  if (type === 'dasher' && e.mode === 'windup') {
+    bodyR = r * 0.8;
+    bodyColor = '#ff5d8f';
+  } else if (type === 'dasher') {
+    bodyColor = '#9d7bff';
+  } else if (type === 'splitter') {
+    bodyColor = '#6a4fd0';
+  } else if (type === 'brute') {
+    bodyColor = '#5a3fd4';
+  } else if (type === 'gloomlord') {
+    bodyColor = '#3d1150';
+  }
+  const pulse = 1 + 0.05 * Math.sin(t * 4 + (e.phase || 0));
+  const blob = ctx.createRadialGradient(
+    e.x - bodyR * 0.25, e.y - bodyR * 0.3, 2, e.x, e.y, bodyR * pulse + 4,
+  );
+  blob.addColorStop(0, '#c9b8ff');
+  blob.addColorStop(0.35, bodyColor);
+  blob.addColorStop(1, '#160b2e');
+  ctx.fillStyle = blob;
+  ctx.beginPath();
+  ctx.arc(e.x, e.y, bodyR * pulse, 0, Math.PI * 2);
+  ctx.fill();
+  // Hit flash: white overlay that fades with e.flash.
+  if (e.flash > 0) {
+    ctx.globalAlpha = clamp(e.flash / 0.12, 0, 1) * 0.85;
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, bodyR * pulse, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
 
-  if (type === 'wisp') {
-    // Small wavy blob: radius wobbles around the rim.
-    ctx.beginPath();
-    const steps = 14;
-    for (let i = 0; i <= steps; i += 1) {
-      const a = (i / steps) * Math.PI * 2;
-      const wob = 1 + 0.16 * Math.sin(a * 3 + t * 6 + (e.seed || 0));
-      const px = e.x + Math.cos(a) * r * wob;
-      const py = e.y + Math.sin(a) * r * wob;
-      if (i === 0) ctx.moveTo(px, py);
-      else ctx.lineTo(px, py);
-    }
-    ctx.closePath();
-    ctx.fill();
-    // Wavy tail.
-    ctx.strokeStyle = 'rgba(184, 169, 255, 0.7)';
+  // Eyes: two pale sparks that track the player (via phase wobble).
+  const eyeDX = Math.cos(t * 0.8 + (e.phase || 0)) * 1.5;
+  const eyeDY = Math.sin(t * 0.8 + (e.phase || 0)) * 1.5;
+  const eyeColor = type === 'gloomlord' ? '#ff3d6e' : type === 'dasher' ? '#ffd166' : '#e8e0ff';
+  ctx.fillStyle = eyeColor;
+  const eyeOff = Math.max(3, r * 0.32);
+  const eyeR = type === 'gloomlord' ? 5 : type === 'brute' ? 3.4 : 2.4;
+  ctx.beginPath();
+  ctx.arc(e.x - eyeOff + eyeDX, e.y - eyeOff * 0.4 + eyeDY, eyeR, 0, Math.PI * 2);
+  ctx.arc(e.x + eyeOff + eyeDX, e.y - eyeOff * 0.4 + eyeDY, eyeR, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Splitter: inner core ring so it reads as "full of something".
+  if (type === 'splitter') {
+    ctx.strokeStyle = '#b8a9ff';
+    ctx.globalAlpha = 0.8;
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.moveTo(e.x - r * 0.5, e.y + r * 0.8);
-    ctx.quadraticCurveTo(e.x, e.y + r * 1.5 + Math.sin(t * 6) * 3, e.x + r * 0.5, e.y + r * 0.8);
+    ctx.arc(e.x, e.y, r * 0.55, 0, Math.PI * 2);
     ctx.stroke();
-  } else if (type === 'crawler') {
-    // Spiked blob: triangular spikes around the rim.
+    ctx.globalAlpha = 1;
+  }
+  // Dasher: lunge-direction spikes while winding up or lunging.
+  if (type === 'dasher' && (e.mode === 'windup' || e.mode === 'lunge')) {
+    const la = Math.atan2(e.lungeY || 0, e.lungeX || 1);
+    ctx.strokeStyle = '#ffd166';
+    ctx.globalAlpha = 0.9;
+    ctx.lineWidth = 2.5;
     ctx.beginPath();
-    const spikes = 8;
-    for (let i = 0; i < spikes * 2; i += 1) {
-      const a = (i / (spikes * 2)) * Math.PI * 2 + t * 0.4;
-      const rr = i % 2 === 0 ? r * 1.35 : r * 0.85;
-      const px = e.x + Math.cos(a) * rr;
-      const py = e.y + Math.sin(a) * rr;
-      if (i === 0) ctx.moveTo(px, py);
-      else ctx.lineTo(px, py);
+    ctx.moveTo(e.x + Math.cos(la) * r, e.y + Math.sin(la) * r);
+    ctx.lineTo(e.x + Math.cos(la) * (r + 16), e.y + Math.sin(la) * (r + 16));
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  // Gloomlord: crown of horns + burning rim.
+  if (type === 'gloomlord') {
+    ctx.strokeStyle = '#ff3d6e';
+    ctx.globalAlpha = 0.9;
+    ctx.shadowColor = '#ff3d6e';
+    ctx.shadowBlur = 16;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, r + 4, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#ff3d6e';
+    for (let i = 0; i < 5; i++) {
+      const a = -Math.PI / 2 + (i - 2) * 0.5;
+      ctx.beginPath();
+      ctx.moveTo(e.x + Math.cos(a) * (r - 4), e.y + Math.sin(a) * (r - 4));
+      ctx.lineTo(e.x + Math.cos(a) * (r + 16), e.y + Math.sin(a) * (r + 16));
+      ctx.lineTo(e.x + Math.cos(a + 0.22) * (r - 2), e.y + Math.sin(a + 0.22) * (r - 2));
+      ctx.closePath();
+      ctx.fill();
     }
-    ctx.closePath();
-    ctx.fill();
-  } else if (type === 'spitter') {
-    // Round blob with a glowing open mouth.
-    ctx.beginPath();
-    ctx.arc(e.x, e.y, r, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.shadowBlur = 0;
-    ctx.fillStyle = '#120826';
-    ctx.beginPath();
-    ctx.arc(e.x, e.y + r * 0.15, r * 0.45, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = PALETTE.shadow;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.arc(e.x, e.y + r * 0.15, r * 0.45, 0, Math.PI * 2);
-    ctx.stroke();
-    glowDot(ctx, e.x, e.y + r * 0.15, 3, '#c9a6ff', 0.8);
-  } else {
-    // Brute: large horned elite.
-    ctx.beginPath();
-    ctx.arc(e.x, e.y, r, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.shadowBlur = 0;
-    // Horns.
-    ctx.fillStyle = '#d9c8ff';
-    ctx.beginPath();
-    ctx.moveTo(e.x - r * 0.75, e.y - r * 0.55);
-    ctx.lineTo(e.x - r * 1.25, e.y - r * 1.35);
-    ctx.lineTo(e.x - r * 0.25, e.y - r * 0.9);
-    ctx.closePath();
-    ctx.moveTo(e.x + r * 0.75, e.y - r * 0.55);
-    ctx.lineTo(e.x + r * 1.25, e.y - r * 1.35);
-    ctx.lineTo(e.x + r * 0.25, e.y - r * 0.9);
-    ctx.closePath();
-    ctx.fill();
-    // Angry brow ridge.
-    ctx.strokeStyle = '#120826';
-    ctx.lineWidth = 4;
-    ctx.beginPath();
-    ctx.moveTo(e.x - r * 0.55, e.y - r * 0.25);
-    ctx.lineTo(e.x - r * 0.1, e.y - r * 0.05);
-    ctx.moveTo(e.x + r * 0.55, e.y - r * 0.25);
-    ctx.lineTo(e.x + r * 0.1, e.y - r * 0.05);
-    ctx.stroke();
+    ctx.globalAlpha = 1;
   }
   ctx.restore();
 
-  // Glowing eyes (all types), colour shifts per type.
-  const eyeColor = type === 'wisp' ? PALETTE.wisp : type === 'brute' ? '#ff6b6b' : '#e6dcff';
-  const eyeY = e.y - r * 0.15;
-  const eyeDX = r * 0.38;
-  const eyeR = type === 'brute' ? 4 : 2.6;
-  glowDot(ctx, e.x - eyeDX, eyeY, eyeR, eyeColor, 0.95);
-  glowDot(ctx, e.x + eyeDX, eyeY, eyeR, eyeColor, 0.95);
-
-  // Hit flash.
-  if (e.flash > 0) {
-    ctx.save();
-    ctx.globalAlpha = clamp(e.flash * 2, 0, 0.8);
-    ctx.fillStyle = '#ffffff';
-    ctx.beginPath();
-    ctx.arc(e.x, e.y, r, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
-  }
-
-  // HP bar when damaged; brutes also get a name tag so the elite reads clearly.
-  if (type === 'brute') {
-    ctx.save();
-    ctx.textAlign = 'center';
-    ctx.font = '800 13px ' + FONT;
-    ctx.fillStyle = '#ff9a9a';
-    ctx.shadowColor = '#ff5d5d';
-    ctx.shadowBlur = 8;
-    ctx.fillText('GLOOMBRUTE', e.x, e.y - r - 22);
-    ctx.restore();
-  }
-  if (maxHp > 1 && hp < maxHp) {
+  // HP bar for tough enemies (brute, splitter, boss) when damaged.
+  if ((type === 'brute' || type === 'splitter' || type === 'gloomlord') && hp < maxHp) {
     const bw = r * 2;
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
-    ctx.fillRect(e.x - bw / 2, e.y - r - 12, bw, 5);
-    ctx.fillStyle = PALETTE.hp;
-    ctx.fillRect(e.x - bw / 2, e.y - r - 12, bw * clamp(hp / maxHp, 0, 1), 5);
+    const bx = e.x - bw / 2;
+    const by = e.y - r - 12;
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(bx, by, bw, 5);
+    ctx.fillStyle = type === 'gloomlord' ? PALETTE.boss : PALETTE.hp;
+    ctx.fillRect(bx, by, bw * clamp(hp / maxHp, 0, 1), 5);
+    ctx.restore();
   }
 }
 
 function drawBullets(ctx, state) {
   for (const b of state.bullets || []) {
-    if (b.x == null) continue;
-    const vx = b.vx || 0;
-    const vy = b.vy || 0;
-    const len = Math.hypot(vx, vy) || 1;
-    const nx = vx / len;
-    const ny = vy / len;
-    const tail = 16;
+    glowDot(ctx, b.x, b.y, 5, PALETTE.ember, 0.95);
     ctx.save();
-    ctx.strokeStyle = PALETTE.ember;
-    ctx.shadowColor = PALETTE.ember;
-    ctx.shadowBlur = 10;
-    ctx.lineWidth = 4;
-    ctx.lineCap = 'round';
-    ctx.beginPath();
-    ctx.moveTo(b.x - nx * tail, b.y - ny * tail);
-    ctx.lineTo(b.x, b.y);
-    ctx.stroke();
     ctx.fillStyle = '#fff3c4';
     ctx.beginPath();
-    ctx.arc(b.x, b.y, 3, 0, Math.PI * 2);
+    ctx.arc(b.x, b.y, 2.4, 0, Math.PI * 2);
     ctx.fill();
     ctx.restore();
   }
-}
-
-function drawEnemyOrbs(ctx, state) {
-  const t = state.time || 0;
   for (const o of state.enemyBullets || []) {
-    if (o.x == null) continue;
-    const r = o.r || 7;
-    const pulse = 1 + 0.15 * Math.sin(t * 8 + o.x);
-    glowDot(ctx, o.x, o.y, r * pulse, PALETTE.shadow, 0.9);
-    ctx.fillStyle = '#e9e2ff';
-    ctx.beginPath();
-    ctx.arc(o.x, o.y, r * 0.35, 0, Math.PI * 2);
-    ctx.fill();
-  }
-}
-
-function drawGemsAndHearts(ctx, state) {
-  const t = state.time || 0;
-  for (const g of state.gems || []) {
-    if (g.x == null) continue;
-    if (g.kind === 'heart') {
-      drawHeart(ctx, g.x, g.y, 10, t);
-      continue;
-    }
-    const s = 7 + Math.sin(t * 5 + g.x * 0.1) * 1.2;
+    glowDot(ctx, o.x, o.y, 6, PALETTE.shadow, 0.9);
     ctx.save();
-    ctx.translate(g.x, g.y);
-    ctx.rotate(Math.PI / 4);
-    ctx.fillStyle = PALETTE.gold;
-    ctx.shadowColor = PALETTE.gold;
-    ctx.shadowBlur = 10;
-    ctx.fillRect(-s / 2, -s / 2, s, s);
+    ctx.fillStyle = '#d9ccff';
+    ctx.beginPath();
+    ctx.arc(o.x, o.y, 3, 0, Math.PI * 2);
+    ctx.fill();
     ctx.restore();
+  }
+  // v2 orbiting embers.
+  for (const o of state.orbiters || []) {
+    glowDot(ctx, o.x, o.y, 7, PALETTE.lantern, 0.95);
+    ctx.save();
     ctx.fillStyle = '#fff7d6';
     ctx.beginPath();
-    ctx.arc(g.x, g.y, 2, 0, Math.PI * 2);
+    ctx.arc(o.x, o.y, 3.4, 0, Math.PI * 2);
     ctx.fill();
-  }
-  for (const h of state.hearts || []) {
-    if (h.x == null) continue;
-    drawHeart(ctx, h.x, h.y, 11, t);
+    ctx.restore();
   }
 }
 
-function drawHeart(ctx, x, y, s, t) {
-  const pulse = 1 + 0.08 * Math.sin(t * 6 + x);
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.scale(pulse, pulse);
-  ctx.fillStyle = '#ff5d7a';
-  ctx.shadowColor = '#ff5d7a';
-  ctx.shadowBlur = 12;
-  ctx.beginPath();
-  ctx.moveTo(0, s * 0.7);
-  ctx.bezierCurveTo(-s * 1.2, -s * 0.1, -s * 0.6, -s * 0.9, 0, -s * 0.25);
-  ctx.bezierCurveTo(s * 0.6, -s * 0.9, s * 1.2, -s * 0.1, 0, s * 0.7);
-  ctx.fill();
-  ctx.restore();
+function drawGems(ctx, state) {
+  const t = state.time || 0;
+  for (const g of state.gems || []) {
+    if (g.kind === 'heart') {
+      ctx.save();
+      ctx.translate(g.x, g.y);
+      ctx.rotate(Math.sin(t * 2 + g.x) * 0.12);
+      ctx.fillStyle = '#7dff8a';
+      ctx.shadowColor = '#7dff8a';
+      ctx.shadowBlur = 10;
+      ctx.beginPath();
+      ctx.moveTo(0, 5);
+      ctx.bezierCurveTo(-8, -3, -5, -9, 0, -4);
+      ctx.bezierCurveTo(5, -9, 8, -3, 0, 5);
+      ctx.fill();
+      ctx.restore();
+    } else {
+      const bob = Math.sin(t * 3 + g.x * 0.05) * 1.5;
+      glowDot(ctx, g.x, g.y + bob, 4.5, PALETTE.gold, 0.95);
+      ctx.save();
+      ctx.fillStyle = '#fff3c4';
+      ctx.beginPath();
+      ctx.arc(g.x, g.y + bob, 2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
 }
 
 function drawParticles(ctx, state) {
-  for (const p of state.particles || []) {
-    if (p.x == null) continue;
-    const maxLife = p.maxLife || 1;
-    const frac = clamp((p.life == null ? 1 : p.life) / maxLife, 0, 1);
-    if (p.kind === 'ring') {
+  for (const pt of state.particles || []) {
+    const frac = clamp(pt.life / pt.maxLife, 0, 1);
+    if (pt.kind === 'ring') {
       ctx.save();
-      ctx.globalAlpha = frac * 0.8;
-      ctx.strokeStyle = p.color || PALETTE.ember;
+      ctx.globalAlpha = frac * 0.9;
+      ctx.strokeStyle = pt.color;
       ctx.lineWidth = 3;
       ctx.beginPath();
-      ctx.arc(p.x, p.y, (p.size || 10) * (1.6 - frac * 0.6), 0, Math.PI * 2);
+      ctx.arc(pt.x, pt.y, pt.size, 0, Math.PI * 2);
       ctx.stroke();
       ctx.restore();
-    } else if (p.kind === 'ember') {
-      glowDot(ctx, p.x, p.y, (p.size || 3) * (0.5 + frac * 0.5), p.color || PALETTE.ember, frac);
     } else {
-      // spark: short bright streak along its velocity.
-      const vx = p.vx || 0;
-      const vy = p.vy || 0;
-      const len = Math.hypot(vx, vy) || 1;
       ctx.save();
       ctx.globalAlpha = frac;
-      ctx.strokeStyle = p.color || '#ffd9a0';
-      ctx.lineWidth = 2;
-      ctx.lineCap = 'round';
+      ctx.fillStyle = pt.color;
       ctx.beginPath();
-      ctx.moveTo(p.x, p.y);
-      ctx.lineTo(p.x - (vx / len) * 10, p.y - (vy / len) * 10);
-      ctx.stroke();
+      ctx.arc(pt.x, pt.y, Math.max(0.5, pt.size * frac), 0, Math.PI * 2);
+      ctx.fill();
       ctx.restore();
     }
   }
+  // Floating combat text.
+  for (const tx of state.texts || []) {
+    const frac = clamp(tx.life / 0.9, 0, 1);
+    ctx.save();
+    ctx.globalAlpha = frac;
+    ctx.fillStyle = tx.color;
+    ctx.font = `bold ${tx.size || 16}px ${FONT}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(tx.text, tx.x, tx.y);
+    ctx.restore();
+  }
 }
 
-function drawTexts(ctx, state) {
+function drawHud(ctx, state, best, screen) {
+  const p = state.player;
+  if (!p) return;
+  const t = state.time || 0;
+
+  // Top-left: HP bar + numbers, dash status.
+  ctx.save();
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.font = `bold 15px ${FONT}`;
+  ctx.fillStyle = PALETTE.text;
+  ctx.fillText(`HP  ${Math.ceil(p.hp)} / ${p.maxHp}`, 24, 28);
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  roundRectPath(ctx, 24, 42, 220, 14, 7);
+  ctx.fill();
+  ctx.fillStyle = PALETTE.hp;
+  roundRectPath(ctx, 24, 42, 220 * clamp(p.hp / p.maxHp, 0, 1), 14, 7);
+  ctx.fill();
+  // Dash pip: cyan when ready (with a soft pulse), grey while recharging.
+  const dashReady = p.dashCooldown <= 0;
+  ctx.fillStyle = dashReady ? PALETTE.dash : 'rgba(125,227,255,0.35)';
+  ctx.beginPath();
+  ctx.arc(258, 49, dashReady ? 7 + Math.sin(t * 4) * 1.2 : 7, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = PALETTE.text;
+  ctx.font = `12px ${FONT}`;
+  ctx.fillText('SHIFT dash', 270, 49);
+  ctx.restore();
+
+  // Top-center: wave + enemies left. Boss bar replaces it on boss waves.
   ctx.save();
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  for (const t of state.texts || []) {
-    if (t.text == null) continue;
-    const a = clamp(t.life == null ? 1 : t.life, 0, 1);
-    ctx.globalAlpha = a;
-    ctx.font = '700 ' + (t.size || 16) + 'px ' + FONT;
-    ctx.fillStyle = t.color || PALETTE.text;
-    ctx.shadowColor = 'rgba(0,0,0,0.8)';
-    ctx.shadowBlur = 4;
-    ctx.fillText(String(t.text), t.x, t.y);
+  if (state.boss && state.boss.hp > 0) {
+    const b = state.boss;
+    ctx.font = `bold 17px ${FONT}`;
+    ctx.fillStyle = PALETTE.boss;
+    ctx.fillText('GLOOMLORD', W / 2, 26);
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    roundRectPath(ctx, W / 2 - 190, 40, 380, 13, 6);
+    ctx.fill();
+    ctx.fillStyle = PALETTE.boss;
+    roundRectPath(ctx, W / 2 - 190, 40, 380 * clamp(b.hp / b.maxHp, 0, 1), 13, 6);
+    ctx.fill();
+  } else {
+    ctx.font = `bold 20px ${FONT}`;
+    ctx.fillStyle = PALETTE.text;
+    const left = (state.enemies || []).length + (state.spawnQueue || []).length;
+    ctx.fillText(`WAVE ${state.wave}`, W / 2, 28);
+    ctx.font = `14px ${FONT}`;
+    ctx.fillStyle = PALETTE.muted;
+    ctx.fillText(`${left} gloom${left === 1 ? '' : 's'} left`, W / 2, 52);
   }
+  ctx.restore();
+
+  // Top-right: score, combo, best.
+  ctx.save();
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  ctx.font = `bold 22px ${FONT}`;
+  ctx.fillStyle = PALETTE.gold;
+  ctx.fillText(`${state.score}`, W - 24, 28);
+  ctx.font = `14px ${FONT}`;
+  ctx.fillStyle = state.combo > 1 ? PALETTE.crit : PALETTE.muted;
+  ctx.fillText(
+    state.combo > 1 ? `COMBO x${state.combo}` : 'no combo',
+    W - 24, 52,
+  );
+  ctx.fillStyle = PALETTE.muted;
+  ctx.font = `13px ${FONT}`;
+  ctx.fillText(`BEST ${Math.max(best || 0, state.score)}`, W - 24, 72);
+  ctx.restore();
+
+  // v2: owned-upgrade strip along the bottom, above the XP bar.
+  const owned = state.owned || {};
+  const names = Object.keys(owned);
+  if (names.length > 0) {
+    ctx.save();
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.font = `12px ${FONT}`;
+    let x = 24;
+    const y = H - 34;
+    for (const id of names) {
+      const label = `${id} ${owned[id]}`;
+      const w = ctx.measureText(label).width + 14;
+      ctx.fillStyle = 'rgba(16,12,36,0.7)';
+      roundRectPath(ctx, x, y - 10, w, 20, 10);
+      ctx.fill();
+      ctx.fillStyle = PALETTE.gold;
+      ctx.fillText(label, x + 7, y);
+      x += w + 6;
+      if (x > W - 200) break;
+    }
+    ctx.restore();
+  }
+
+  // Bottom: XP bar, full width, with level.
+  const frac = clamp(p.xp / (p.xpNext || 1), 0, 1);
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(0, H - 18, W, 18);
+  ctx.fillStyle = PALETTE.xp;
+  ctx.fillRect(0, H - 18, W * frac, 18);
+  ctx.fillStyle = PALETTE.text;
+  ctx.font = `bold 12px ${FONT}`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(`LEVEL ${p.level}   ${p.xp} / ${p.xpNext} XP`, W / 2, H - 9);
+  ctx.restore();
+
+  // Wave banner: breather / cleared text, big and centred. Only on the
+  // PLAY screen — on LEVELUP it would bleed through the upgrade cards.
+  if (screen === SCREEN_PLAY
+    && (state.waveState === 'breather' || state.waveState === 'cleared')) {
+    const isSwarm = state.wave % 4 === 0 && state.wave % 10 !== 0;
+    const isBoss = state.wave % 10 === 0;
+    const label = state.waveState === 'breather'
+      ? (isBoss ? `WAVE ${state.wave} — THE GLOOMLORD` : isSwarm ? `WAVE ${state.wave} — SWARM!` : `WAVE ${state.wave}`)
+      : `WAVE ${state.wave} CLEAR`;
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = `bold 44px ${FONT}`;
+    ctx.shadowColor = isBoss ? PALETTE.boss : PALETTE.ember;
+    ctx.shadowBlur = 24;
+    ctx.fillStyle = isBoss ? PALETTE.boss : PALETTE.gold;
+    ctx.fillText(label, W / 2, H / 2 - 60);
+    ctx.restore();
+  }
+
+  // v2: low-HP vignette pulse — red edges close in as HP drops.
+  const hpFrac = clamp(p.hp / p.maxHp, 0, 1);
+  if (hpFrac < 0.35 && !state.over) {
+    const pulse = 0.22 + 0.1 * Math.sin(t * 5);
+    const alpha = pulse * (1 - hpFrac / 0.35);
+    const vg = ctx.createRadialGradient(
+      W / 2, H / 2, H * 0.32, W / 2, H / 2, H * 0.75,
+    );
+    vg.addColorStop(0, 'rgba(255, 40, 60, 0)');
+    vg.addColorStop(1, `rgba(255, 40, 60, ${clamp(alpha, 0, 0.5)})`);
+    ctx.save();
+    ctx.fillStyle = vg;
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+  }
+
+  // Damage vignette flash when recently hurt.
+  if (p.invuln > 0.55 && !state.over) {
+    ctx.save();
+    ctx.globalAlpha = clamp((p.invuln - 0.55) / 0.25, 0, 1) * 0.25;
+    ctx.fillStyle = '#ff2d3c';
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+  }
+}
+
+function drawTitle(ctx, state, best) {
+  const t = state.time || 0;
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  // Big title with ember glow.
+  ctx.font = `bold 92px ${FONT}`;
+  ctx.shadowColor = PALETTE.ember;
+  ctx.shadowBlur = 34;
+  ctx.fillStyle = PALETTE.gold;
+  ctx.fillText('EMBERFALL', W / 2, 190);
+  ctx.shadowBlur = 0;
+  ctx.font = `italic 26px ${FONT}`;
+  ctx.fillStyle = PALETTE.text;
+  ctx.fillText('Hold the light. Survive the dark.', W / 2, 258);
+  // v2 tagline: what is new.
+  ctx.font = `15px ${FONT}`;
+  ctx.fillStyle = PALETTE.gold;
+  ctx.fillText('v2 — dash through the dark, face the Gloomlord, forge 12 upgrades', W / 2, 296);
+  // Controls.
+  ctx.font = `17px ${FONT}`;
+  ctx.fillStyle = PALETTE.muted;
+  ctx.fillText('WASD / Arrows — move     Mouse — aim     Hold Click / Space — fire', W / 2, 350);
+  ctx.fillText('SHIFT / Right Click — dash (brief invulnerability)', W / 2, 380);
+  ctx.fillText('Collect ember shards to level up. Every 5th wave, a Gloombrute hunts you.', W / 2, 410);
+  ctx.fillText('Every 10th wave, the GLOOMLORD. Every 4th wave, a swarm.', W / 2, 440);
+  ctx.fillText('P — pause     M — mute     R — restart', W / 2, 478);
+  if (best > 0) {
+    ctx.font = `bold 18px ${FONT}`;
+    ctx.fillStyle = PALETTE.gold;
+    ctx.fillText(`BEST SCORE  ${best}`, W / 2, 528);
+  }
+  // Blinking start prompt.
+  const blink = 0.55 + 0.45 * Math.sin(t * 3.2);
+  ctx.globalAlpha = blink;
+  ctx.font = `bold 22px ${FONT}`;
+  ctx.fillStyle = PALETTE.ember;
+  ctx.fillText('CLICK OR PRESS SPACE TO BEGIN', W / 2, 600);
+  ctx.restore();
+}
+
+function drawLevelUp(ctx, state) {
+  const rects = cardRects();
+  ctx.save();
+  ctx.fillStyle = 'rgba(6, 4, 18, 0.66)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = `bold 40px ${FONT}`;
+  ctx.fillStyle = PALETTE.gold;
+  ctx.shadowColor = PALETTE.gold;
+  ctx.shadowBlur = 18;
+  ctx.fillText('LEVEL UP!', W / 2, 210);
+  ctx.shadowBlur = 0;
+  ctx.font = `17px ${FONT}`;
+  ctx.fillStyle = PALETTE.text;
+  ctx.fillText('Choose one ember to kindle — press 1, 2 or 3, or click a card.', W / 2, 252);
+  const choices = state.choices || [];
+  for (let i = 0; i < rects.length; i++) {
+    const r = rects[i];
+    const choice = choices[i];
+    if (!choice) continue;
+    ctx.fillStyle = PALETTE.panel;
+    roundRectPath(ctx, r.x, r.y, r.w, r.h, 14);
+    ctx.fill();
+    ctx.strokeStyle = PALETTE.ember;
+    ctx.globalAlpha = 0.85;
+    ctx.lineWidth = 2;
+    roundRectPath(ctx, r.x, r.y, r.w, r.h, 14);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = PALETTE.gold;
+    ctx.font = `bold 13px ${FONT}`;
+    ctx.fillText(`[ ${i + 1} ]`, r.x + r.w / 2, r.y + 28);
+    ctx.fillStyle = PALETTE.text;
+    ctx.font = `bold 21px ${FONT}`;
+    const nameLines = wrapText(ctx, choice.name, r.w - 32);
+    let ny = r.y + 62;
+    for (const line of nameLines) {
+      ctx.fillText(line, r.x + r.w / 2, ny);
+      ny += 26;
+    }
+    ctx.fillStyle = PALETTE.muted;
+    ctx.font = `15px ${FONT}`;
+    const descLines = wrapText(ctx, choice.desc, r.w - 32);
+    let dy = ny + 14;
+    for (const line of descLines) {
+      ctx.fillText(line, r.x + r.w / 2, dy);
+      dy += 21;
+    }
+    // Stack pips: filled = owned, empty = remaining.
+    const owned = (state.owned || {})[choice.id] || 0;
+    const max = choice.max || 5;
+    const pipW = 16;
+    const totalPip = pipW * max + 6 * (max - 1);
+    let px = r.x + (r.w - totalPip) / 2;
+    const py = r.y + r.h - 30;
+    for (let s = 0; s < max; s++) {
+      ctx.fillStyle = s < owned ? PALETTE.gold : 'rgba(255,255,255,0.18)';
+      ctx.beginPath();
+      ctx.arc(px + pipW / 2, py, 6, 0, Math.PI * 2);
+      ctx.fill();
+      px += pipW + 6;
+    }
+  }
+  ctx.restore();
+}
+
+function drawPaused(ctx) {
+  ctx.save();
+  ctx.fillStyle = 'rgba(6, 4, 18, 0.6)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = `bold 52px ${FONT}`;
+  ctx.fillStyle = PALETTE.text;
+  ctx.fillText('PAUSED', W / 2, H / 2 - 30);
+  ctx.font = `17px ${FONT}`;
+  ctx.fillStyle = PALETTE.muted;
+  ctx.fillText('P or Escape — resume     R — restart', W / 2, H / 2 + 24);
+  ctx.restore();
+}
+
+function drawOver(ctx, state, best) {
+  const rs = state.runStats || {};
+  const isBest = state.score > 0 && state.score >= best;
+  ctx.save();
+  ctx.fillStyle = 'rgba(6, 4, 18, 0.72)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = `bold 54px ${FONT}`;
+  ctx.fillStyle = PALETTE.hp;
+  ctx.fillText('THE LIGHT FADES', W / 2, 150);
+  ctx.font = `bold 30px ${FONT}`;
+  ctx.fillStyle = PALETTE.gold;
+  ctx.fillText(`SCORE  ${state.score}`, W / 2, 216);
+  if (isBest) {
+    ctx.font = `bold 20px ${FONT}`;
+    ctx.fillStyle = '#7dff8a';
+    ctx.fillText('★ NEW BEST! ★', W / 2, 254);
+  }
+  // v2 run stats: two columns of verified numbers.
+  ctx.font = `17px ${FONT}`;
+  ctx.fillStyle = PALETTE.text;
+  const leftX = W / 2 - 190;
+  const rightX = W / 2 + 190;
+  ctx.textAlign = 'left';
+  ctx.fillText(`Wave reached: ${state.wave}`, leftX, 310);
+  ctx.fillText(`Glooms slain: ${state.kills}`, leftX, 340);
+  ctx.fillText(`Best combo: x${rs.bestCombo || 1}`, leftX, 370);
+  ctx.fillText(`Bosses slain: ${rs.bossKills || 0}`, leftX, 400);
+  ctx.fillText(`Time survived: ${Math.floor(state.time)}s`, rightX - 170, 310);
+  const acc = rs.shots > 0 ? Math.round((100 * rs.hits) / rs.shots) : 0;
+  ctx.fillText(`Accuracy: ${acc}%`, rightX - 170, 340);
+  ctx.fillText(`Dashes: ${rs.dashes || 0}`, rightX - 170, 370);
+  ctx.fillText(`Nova kills: ${rs.novaKills || 0}   Crits: ${rs.crits || 0}`, rightX - 170, 400);
+  ctx.textAlign = 'center';
+  ctx.font = `15px ${FONT}`;
+  ctx.fillStyle = PALETTE.muted;
+  ctx.fillText(`Best score: ${best}`, W / 2, 452);
+  const blink = 0.55 + 0.45 * Math.sin((state.time || 0) * 3.2);
+  ctx.globalAlpha = blink;
+  ctx.font = `bold 20px ${FONT}`;
+  ctx.fillStyle = PALETTE.ember;
+  ctx.fillText('PRESS R OR SPACE TO KINDLE AGAIN', W / 2, 510);
   ctx.restore();
 }
 
 export function createRenderer(canvas) {
   const ctx = canvas.getContext('2d');
-  let hurtFlash = 0;
-  let lastHp = null;
-
-  function drawHud(state, best) {
-    const p = state.player || {};
-    const hp = p.hp == null ? 100 : p.hp;
-    const maxHp = p.maxHp == null ? 100 : p.maxHp;
-    const level = p.level == null ? 1 : p.level;
-    const xp = p.xp == null ? 0 : p.xp;
-    const xpNext = p.xpNext == null ? 1 : p.xpNext;
-    const queue = Array.isArray(state.spawnQueue) ? state.spawnQueue.length : (state.spawnQueue || 0);
-    const left = queue + (state.enemies || []).length;
-
-    ctx.save();
-    ctx.textBaseline = 'middle';
-
-    // HP bar, top-left.
-    ctx.fillStyle = PALETTE.panel;
-    roundRectPath(ctx, 20, 18, 260, 52, 10);
-    ctx.fill();
-    ctx.fillStyle = PALETTE.muted;
-    ctx.font = '700 13px ' + FONT;
-    ctx.textAlign = 'left';
-    ctx.fillText('HP', 32, 34);
-    ctx.fillStyle = 'rgba(0,0,0,0.6)';
-    roundRectPath(ctx, 32, 44, 220, 12, 6);
-    ctx.fill();
-    const hpFrac = clamp(hp / Math.max(1, maxHp), 0, 1);
-    const hg = ctx.createLinearGradient(32, 0, 252, 0);
-    hg.addColorStop(0, '#ff8a5d');
-    hg.addColorStop(1, PALETTE.hp);
-    ctx.fillStyle = hg;
-    if (hpFrac > 0) {
-      roundRectPath(ctx, 32, 44, 220 * hpFrac, 12, 6);
-      ctx.fill();
-    }
-    ctx.fillStyle = PALETTE.text;
-    ctx.font = '700 13px ' + FONT;
-    ctx.textAlign = 'right';
-    ctx.fillText(Math.ceil(hp) + ' / ' + maxHp, 252, 34);
-    // Low-HP warning: pulsing red rim around the HP panel.
-    if (hpFrac < 0.3) {
-      const pulse = 0.4 + 0.4 * Math.sin((state.time || 0) * 6);
-      ctx.save();
-      ctx.globalAlpha = pulse;
-      ctx.strokeStyle = PALETTE.hp;
-      ctx.lineWidth = 2;
-      roundRectPath(ctx, 20, 18, 260, 52, 10);
-      ctx.stroke();
-      ctx.restore();
-    }
-
-    // Wave + enemies left, top-centre.
-    ctx.textAlign = 'center';
-    ctx.fillStyle = PALETTE.text;
-    ctx.font = '800 26px ' + FONT;
-    ctx.fillText('WAVE ' + (state.wave || 1), W / 2, 36);
-    ctx.fillStyle = PALETTE.muted;
-    ctx.font = '600 14px ' + FONT;
-    ctx.fillText(left + ' gloom' + (left === 1 ? '' : 's') + ' left', W / 2, 60);
-
-    // Score + combo + best, top-right.
-    ctx.textAlign = 'right';
-    ctx.fillStyle = PALETTE.gold;
-    ctx.font = '800 24px ' + FONT;
-    ctx.fillText((state.score || 0).toLocaleString('en-US'), W - 24, 34);
-    ctx.fillStyle = PALETTE.muted;
-    ctx.font = '600 13px ' + FONT;
-    ctx.fillText('BEST ' + (best || 0).toLocaleString('en-US'), W - 24, 58);
-    if (state.combo > 1) {
-      ctx.fillStyle = PALETTE.ember;
-      ctx.font = '800 20px ' + FONT;
-      ctx.fillText('COMBO x' + state.combo, W - 24, 82);
-      // Combo timer: thin bar draining under the combo label.
-      const ct = clamp((state.comboTimer == null ? 0 : state.comboTimer) / 2.5, 0, 1);
-      ctx.fillStyle = 'rgba(0,0,0,0.6)';
-      ctx.fillRect(W - 124, 92, 100, 5);
-      ctx.fillStyle = PALETTE.ember;
-      ctx.fillRect(W - 124, 92, 100 * ct, 5);
-    }
-
-    // XP bar, bottom full width.
-    const barX = 24;
-    const barW = W - 48;
-    const barY = H - 30;
-    ctx.fillStyle = 'rgba(0,0,0,0.6)';
-    roundRectPath(ctx, barX, barY, barW, 14, 7);
-    ctx.fill();
-    const xpFrac = clamp(xp / Math.max(1, xpNext), 0, 1);
-    if (xpFrac > 0) {
-      const xg = ctx.createLinearGradient(barX, 0, barX + barW, 0);
-      xg.addColorStop(0, PALETTE.ember);
-      xg.addColorStop(1, PALETTE.xp);
-      ctx.fillStyle = xg;
-      roundRectPath(ctx, barX, barY, barW * xpFrac, 14, 7);
-      ctx.fill();
-    }
-    ctx.fillStyle = PALETTE.text;
-    ctx.font = '800 14px ' + FONT;
-    ctx.textAlign = 'left';
-    ctx.fillText('LEVEL ' + level, barX, barY - 14);
-    ctx.textAlign = 'right';
-    ctx.fillText(Math.floor(xp) + ' / ' + xpNext + ' XP', barX + barW, barY - 14);
-    ctx.restore();
-  }
-
-  function drawWaveBanner(state) {
-    if (state.waveState === 'breather') {
-      ctx.save();
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillStyle = PALETTE.text;
-      ctx.font = '800 64px ' + FONT;
-      ctx.shadowColor = PALETTE.ember;
-      ctx.shadowBlur = 30;
-      ctx.fillText('WAVE ' + (state.wave || 1), W / 2, H / 2 - 30);
-      ctx.shadowBlur = 0;
-      ctx.fillStyle = PALETTE.muted;
-      ctx.font = '600 20px ' + FONT;
-      ctx.fillText('Hold the light...', W / 2, H / 2 + 24);
-      ctx.restore();
-    } else if (state.waveState === 'cleared') {
-      ctx.save();
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillStyle = PALETTE.gold;
-      ctx.font = '800 52px ' + FONT;
-      ctx.shadowColor = PALETTE.gold;
-      ctx.shadowBlur = 24;
-      ctx.fillText('WAVE CLEARED', W / 2, H / 2 - 30);
-      ctx.shadowBlur = 0;
-      ctx.fillStyle = PALETTE.text;
-      ctx.font = '700 22px ' + FONT;
-      ctx.fillText('BONUS +' + 50 * (state.wave || 1), W / 2, H / 2 + 22);
-      ctx.restore();
-    }
-  }
-
-  function drawTitleEmbers(state) {
-    const t = state.time || 0;
-    ctx.save();
-    for (let i = 0; i < 48; i += 1) {
-      const x = (i * 197.3 + 40) % W;
-      const speed = 14 + (i % 5) * 7;
-      const y = H + 20 - ((t * speed + i * 53) % (H + 60));
-      const sway = Math.sin(t * 0.9 + i) * 12;
-      const a = 0.25 + 0.55 * Math.abs(Math.sin(t * 1.3 + i * 2.1));
-      glowDot(ctx, x + sway, y, 2 + (i % 3), i % 4 === 0 ? PALETTE.gold : PALETTE.ember, a);
-    }
-    ctx.restore();
-  }
-
-  function drawTitle(state, best) {
-    drawTitleEmbers(state);
-    const t = state.time || 0;
-    ctx.save();
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-
-    ctx.fillStyle = PALETTE.gold;
-    ctx.font = '800 96px ' + FONT;
-    ctx.shadowColor = PALETTE.ember;
-    ctx.shadowBlur = 42;
-    ctx.fillText('EMBERFALL', W / 2, 218);
-    ctx.shadowBlur = 0;
-
-    ctx.fillStyle = PALETTE.text;
-    ctx.font = 'italic 600 26px ' + FONT;
-    ctx.fillText('Hold the light. Survive the dark.', W / 2, 292);
-
-    ctx.fillStyle = PALETTE.ember;
-    ctx.font = '700 16px ' + FONT;
-    ctx.fillText('✦  ✦  ✦', W / 2, 330);
-
-    ctx.fillStyle = PALETTE.muted;
-    ctx.font = '500 18px ' + FONT;
-    ctx.fillText('WASD / Arrows — move        Mouse — aim        Hold Click / Space — fire', W / 2, 372);
-    ctx.fillText('Collect ember shards to level up. Every 5th wave, a Gloombrute hunts you.', W / 2, 404);
-    ctx.fillText('P — pause        M — mute        R — restart', W / 2, 436);
-
-    if (best > 0) {
-      ctx.fillStyle = PALETTE.gold;
-      ctx.font = '700 20px ' + FONT;
-      ctx.fillText('BEST SCORE  ' + best.toLocaleString('en-US'), W / 2, 486);
-    }
-
-    const pulse = 0.55 + 0.45 * Math.sin(t * 3);
-    ctx.globalAlpha = pulse;
-    ctx.fillStyle = PALETTE.ember;
-    ctx.font = '800 24px ' + FONT;
-    ctx.fillText('CLICK OR PRESS SPACE TO BEGIN', W / 2, 556);
-    ctx.restore();
-  }
-
-  function drawLevelUp(state) {
-    ctx.save();
-    ctx.fillStyle = 'rgba(8, 6, 20, 0.72)';
-    ctx.fillRect(0, 0, W, H);
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = PALETTE.gold;
-    ctx.font = '800 52px ' + FONT;
-    ctx.shadowColor = PALETTE.ember;
-    ctx.shadowBlur = 26;
-    ctx.fillText('LEVEL UP', W / 2, 150);
-    ctx.shadowBlur = 0;
-    ctx.fillStyle = PALETTE.text;
-    ctx.font = '600 24px ' + FONT;
-    ctx.fillText('CHOOSE AN EMBER', W / 2, 208);
-
-    const rects = cardRects();
-    const choices = state.choices || [];
-    for (let i = 0; i < 3; i += 1) {
-      const r = rects[i];
-      const c = choices[i] || {};
-      const name = c.name || 'Ember';
-      const desc = c.desc || c.description || '';
-      const level = clamp(c.level == null ? (c.stacks == null ? 0 : c.stacks) : c.level, 0, 5);
-
-      ctx.fillStyle = PALETTE.panel;
-      roundRectPath(ctx, r.x, r.y, r.w, r.h, 14);
-      ctx.fill();
-      ctx.strokeStyle = PALETTE.gold;
-      ctx.globalAlpha = 0.9;
-      ctx.lineWidth = 2;
-      ctx.stroke();
-      ctx.globalAlpha = 1;
-
-      // Ember glyph.
-      glowDot(ctx, r.x + r.w / 2, r.y + 52, 16, PALETTE.ember, 0.9);
-      ctx.fillStyle = '#fff3c4';
-      ctx.font = '800 22px ' + FONT;
-      ctx.fillText('' + (i + 1), r.x + r.w / 2, r.y + 52);
-
-      ctx.fillStyle = PALETTE.text;
-      ctx.font = '800 22px ' + FONT;
-      ctx.fillText(name, r.x + r.w / 2, r.y + 104);
-
-      ctx.fillStyle = PALETTE.muted;
-      ctx.font = '500 15px ' + FONT;
-      const lines = wrapText(ctx, desc, r.w - 36);
-      lines.slice(0, 3).forEach((line, li) => {
-        ctx.fillText(line, r.x + r.w / 2, r.y + 138 + li * 20);
-      });
-
-      // Level pips: 5 dots, filled = current stacks.
-      for (let p = 0; p < 5; p += 1) {
-        const px = r.x + r.w / 2 + (p - 2) * 22;
-        const py = r.y + r.h - 34;
-        ctx.fillStyle = p < level ? PALETTE.gold : 'rgba(139, 134, 163, 0.4)';
-        ctx.beginPath();
-        ctx.arc(px, py, 6, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      ctx.fillStyle = PALETTE.muted;
-      ctx.font = '600 12px ' + FONT;
-      ctx.fillText('press ' + (i + 1) + ' or click', r.x + r.w / 2, r.y + r.h - 14);
-    }
-    ctx.restore();
-  }
-
-  function drawPaused() {
-    ctx.save();
-    ctx.fillStyle = 'rgba(8, 6, 20, 0.7)';
-    ctx.fillRect(0, 0, W, H);
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = PALETTE.text;
-    ctx.font = '800 64px ' + FONT;
-    ctx.fillText('PAUSED', W / 2, H / 2 - 30);
-    ctx.fillStyle = PALETTE.muted;
-    ctx.font = '600 20px ' + FONT;
-    ctx.fillText('P / Esc — resume        R — restart        M — mute', W / 2, H / 2 + 30);
-    ctx.restore();
-  }
-
-  function drawOver(state, best) {
-    const score = state.score || 0;
-    const isBest = score > 0 && score >= (best || 0);
-    ctx.save();
-    ctx.fillStyle = 'rgba(8, 6, 20, 0.78)';
-    ctx.fillRect(0, 0, W, H);
-
-    const pw = 560;
-    const ph = 400;
-    const px = (W - pw) / 2;
-    const py = (H - ph) / 2;
-    ctx.fillStyle = PALETTE.panel;
-    roundRectPath(ctx, px, py, pw, ph, 18);
-    ctx.fill();
-    ctx.strokeStyle = PALETTE.ember;
-    ctx.lineWidth = 2;
-    ctx.stroke();
-
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = PALETTE.hp;
-    ctx.font = '800 46px ' + FONT;
-    ctx.fillText('THE LIGHT FADES', W / 2, py + 62);
-
-    if (isBest) {
-      ctx.fillStyle = PALETTE.gold;
-      ctx.font = '800 24px ' + FONT;
-      ctx.shadowColor = PALETTE.gold;
-      ctx.shadowBlur = 18;
-      ctx.fillText('★ NEW BEST! ★', W / 2, py + 108);
-      ctx.shadowBlur = 0;
-    }
-
-    ctx.fillStyle = PALETTE.text;
-    ctx.font = '700 22px ' + FONT;
-    ctx.fillText('SCORE   ' + score.toLocaleString('en-US'), W / 2, py + (isBest ? 158 : 138));
-    ctx.fillStyle = PALETTE.muted;
-    ctx.font = '600 19px ' + FONT;
-    const rowY = py + (isBest ? 196 : 176);
-    ctx.fillText('Wave ' + (state.wave || 1) + '    ·    ' + (state.kills || 0) + ' glooms banished', W / 2, rowY);
-    ctx.fillText('Best  ' + Math.max(best || 0, score).toLocaleString('en-US'), W / 2, rowY + 34);
-
-    const pulse = 0.55 + 0.45 * Math.sin((state.time || 0) * 3);
-    ctx.globalAlpha = pulse;
-    ctx.fillStyle = PALETTE.ember;
-    ctx.font = '800 22px ' + FONT;
-    ctx.fillText('PRESS R OR CLICK TO TRY AGAIN', W / 2, py + ph - 52);
-    ctx.restore();
-  }
+  // v2 fade transitions: each screen change fades in from black over 0.25s.
+  let lastScreen = null;
+  let fadeT = 1;
 
   function draw(state, screen, best) {
-    if (!state) return;
-    const p = state.player || {};
-    const hp = p.hp == null ? 100 : p.hp;
-    if (lastHp != null && hp < lastHp) hurtFlash = 1;
-    lastHp = hp;
-    hurtFlash = Math.max(0, hurtFlash - 0.03);
+    if (!ctx) return;
+    if (screen !== lastScreen) {
+      lastScreen = screen;
+      fadeT = 0;
+    }
+    if (fadeT < 1) fadeT = Math.min(1, fadeT + 1 / 15);
 
     ctx.save();
     const shake = state.shake || 0;
     if (shake > 0.2) {
-      ctx.translate((Math.random() * 2 - 1) * shake, (Math.random() * 2 - 1) * shake);
+      const sx = (Math.random() * 2 - 1) * shake * 0.6;
+      const sy = (Math.random() * 2 - 1) * shake * 0.6;
+      ctx.translate(sx, sy);
     }
 
     drawArena(ctx, state);
-
-    // Playfield entities render behind every overlay except the bare title
-    // backdrop; the attract world still drifts behind the title text.
-    drawGemsAndHearts(ctx, state);
-    const t = state.time || 0;
-    for (const e of state.enemies || []) drawEnemy(ctx, e, t);
-    drawEnemyOrbs(ctx, state);
-    drawBullets(ctx, state);
-    if (screen !== SCREEN_TITLE) drawPlayer(ctx, state);
-    drawParticles(ctx, state);
-    drawTexts(ctx, state);
-
-    if (screen === SCREEN_PLAY || screen === SCREEN_LEVELUP || screen === SCREEN_PAUSED) {
-      drawHud(state, best);
+    // Title screen keeps the attract-mode wisps drifting behind the text.
+    if (screen !== SCREEN_TITLE) {
+      drawGems(ctx, state);
+      drawBullets(ctx, state);
+      for (const e of state.enemies || []) drawEnemy(ctx, e, state.time || 0);
+      drawPlayer(ctx, state);
+      drawParticles(ctx, state);
+    } else {
+      for (const e of state.enemies || []) drawEnemy(ctx, e, state.time || 0);
+      drawParticles(ctx, state);
     }
-    if (screen === SCREEN_PLAY) drawWaveBanner(state);
+
+    if (screen === SCREEN_TITLE) drawTitle(ctx, state, best);
+    else if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED) drawHud(ctx, state, best, screen);
+    if (screen === SCREEN_LEVELUP) {
+      drawHud(ctx, state, best, screen);
+      drawLevelUp(ctx, state);
+    } else if (screen === SCREEN_PAUSED) {
+      drawPaused(ctx);
+    } else if (screen === SCREEN_OVER) {
+      drawOver(ctx, state, best);
+    }
     ctx.restore();
 
-    // Damage vignette: red edges flashing just after a hit.
-    if (hurtFlash > 0.02) {
+    // Fade-in overlay after a screen change.
+    if (fadeT < 1) {
       ctx.save();
-      const vg = ctx.createRadialGradient(W / 2, H / 2, H * 0.32, W / 2, H / 2, H * 0.78);
-      vg.addColorStop(0, 'rgba(255, 40, 40, 0)');
-      vg.addColorStop(1, 'rgba(255, 40, 40, ' + (hurtFlash * 0.55).toFixed(3) + ')');
-      ctx.fillStyle = vg;
+      ctx.globalAlpha = (1 - fadeT) * 0.85;
+      ctx.fillStyle = '#05030f';
       ctx.fillRect(0, 0, W, H);
       ctx.restore();
     }
-
-    if (screen === SCREEN_TITLE) drawTitle(state, best);
-    else if (screen === SCREEN_LEVELUP) drawLevelUp(state);
-    else if (screen === SCREEN_PAUSED) drawPaused();
-    else if (screen === SCREEN_OVER) drawOver(state, best);
   }
 
   return { draw, cardRects };
