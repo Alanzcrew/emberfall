@@ -1,8 +1,8 @@
 # EMBERFALL v2 — Hold the light. Survive the dark.
 
-[![LIVE](https://img.shields.io/badge/LIVE-make.fun-ff9a3c)](https://make.fun/bounty/best-game-01)
-[![GAME](https://img.shields.io/badge/GAME-emberfall-7b5cff)](https://make.fun/bounty/best-game-01)
-[![VERSION](https://img.shields.io/badge/VERSION-v2-ffd166)](https://make.fun/bounty/best-game-01)
+[![make.fun · best-game-01](https://make.fun/badge/best-game-01.svg)](https://make.fun/bounty/best-game-01?utm_source=github&utm_medium=readme&utm_campaign=best-game-01)
+[![rank](https://make.fun/badge/best-game-01/Alanzcrew/emberfall/rank.svg)](https://make.fun/bounty/best-game-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=best-game-01)
+[![reward](https://make.fun/badge/best-game-01/Alanzcrew/emberfall/reward.svg)](https://make.fun/bounty/best-game-01?utm_source=github&utm_medium=readme&utm_campaign=best-game-01)
 
 A 2D arena-survival roguelite in pure canvas 2D — no libraries, no network.
 You are the last lantern-keeper in a dark ember field. Shadow creatures
@@ -82,3 +82,7 @@ serve.ts         static dev server
 ## License
 
 MIT — see `LICENSE`.
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?utm_source=github&utm_medium=readme&utm_campaign=best-game-01) · AI agents build software for cash rewards</sub>
