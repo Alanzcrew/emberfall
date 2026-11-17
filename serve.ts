@@ -1,17 +1,19 @@
-// EMBERFALL v2 — static server for game/ (dev + screenshot harness only).
-// Serves the game directory on http://localhost:8080 by default, with a MIME
-// map, a path-traversal guard, and 404s for anything outside game/.
-// Run: `node serve.ts [--port 8080]`. Node 22 stdlib only.
+// A tiny static server for game/ (Node 22, standard library only), so an entry can be played
+// locally without a build step: `node serve.ts` serves game/ on http://localhost:8080.
+// It sends the MIME types a browser game needs, refuses any path outside game/, and otherwise
+// does nothing clever: this is a development convenience, not a web server for the internet.
+import { createReadStream, statSync } from 'node:fs';
 import { createServer } from 'node:http';
-import { readFile } from 'node:fs/promises';
-import { existsSync, statSync } from 'node:fs';
-import { join, normalize, resolve } from 'node:path';
+import { extname, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const here = fileURLToPath(new URL('.', import.meta.url));
-const root = resolve(join(here, 'game'));
+const root = resolve(fileURLToPath(new URL('./game', import.meta.url)));
+const args = process.argv.slice(2);
+const portIndex = args.indexOf('--port');
+const requested = portIndex === -1 ? 8080 : Number(args[portIndex + 1]);
+const port = Number.isInteger(requested) && requested > 0 && requested < 65536 ? requested : 8080;
 
-const MIME = {
+const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.mjs': 'text/javascript; charset=utf-8',
@@ -20,53 +22,51 @@ const MIME = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+  '.glb': 'model/gltf-binary',
+  '.gltf': 'model/gltf+json',
+  '.bin': 'application/octet-stream',
+  '.wasm': 'application/wasm',
+  '.wav': 'audio/wav',
+  '.mp3': 'audio/mpeg',
+  '.ogg': 'audio/ogg',
+  '.txt': 'text/plain; charset=utf-8',
 };
 
-function portFromArgs() {
-  const idx = process.argv.indexOf('--port');
-  if (idx >= 0 && process.argv[idx + 1]) {
-    const n = Number(process.argv[idx + 1]);
-    if (Number.isFinite(n) && n > 0 && n < 65536) return n;
-  }
-  return 8080;
-}
-
-const port = portFromArgs();
-
-const server = createServer(async (req, res) => {
+createServer((request, response) => {
+  const url = new URL(request.url ?? '/', 'http://localhost');
+  let pathname: string;
   try {
-    const url = new URL(req.url || '/', 'http://localhost');
-    let path = decodeURIComponent(url.pathname);
-    if (path === '/') path = '/index.html';
-    const file = resolve(join(root, normalize(path).replace(/^(\.\.[/\\])+/, '')));
-    // Path-traversal guard: the resolved file must stay under game/.
-    if (!file.startsWith(root + '/') && file !== root) {
-      res.writeHead(403, { 'content-type': 'text/plain' });
-      res.end('forbidden');
-      return;
-    }
-    if (!existsSync(file) || !statSync(file).isFile()) {
-      res.writeHead(404, { 'content-type': 'text/plain' });
-      res.end('not found');
-      return;
-    }
-    const ext = file.slice(file.lastIndexOf('.')).toLowerCase();
-    const body = await readFile(file);
-    res.writeHead(200, {
-      'content-type': MIME[ext] || 'application/octet-stream',
-      'content-length': body.length,
-      // Dev server: never cache, so screenshot runs always see fresh code.
-      'cache-control': 'no-store',
-    });
-    res.end(body);
-  } catch (err) {
-    res.writeHead(500, { 'content-type': 'text/plain' });
-    res.end('server error');
+    pathname = decodeURIComponent(url.pathname);
+  } catch {
+    response.writeHead(400).end('bad request');
+    return;
   }
-});
-
-server.listen(port, () => {
-  console.log(`EMBERFALL v2 serving game/ on http://localhost:${port}/`);
+  if (pathname.endsWith('/')) pathname += 'index.html';
+  const file = resolve(join(root, normalize(pathname)));
+  if (file !== root && !file.startsWith(root + sep)) {
+    response.writeHead(403).end('forbidden');
+    return;
+  }
+  let size: number;
+  try {
+    const stats = statSync(file);
+    if (!stats.isFile()) throw new Error('not a file');
+    size = stats.size;
+  } catch {
+    response.writeHead(404).end('not found');
+    return;
+  }
+  response.writeHead(200, {
+    'content-type': MIME[extname(file).toLowerCase()] ?? 'application/octet-stream',
+    'content-length': size,
+    'cache-control': 'no-store',
+  });
+  createReadStream(file).pipe(response);
+}).listen(port, '127.0.0.1', () => {
+  console.log(`game/ is on http://localhost:${port}`);
 });

@@ -1,340 +1,237 @@
-// Emberfall v2 boot: ?shot / ?seed handling, fixed-step loop, screen state machine.
-// v2: dash input (Shift / right-click) is passed into the world each step,
-// and the new v2 events (dash, nova, boss, streak) get their sounds.
-import { STEP, BEST_KEY } from './config.js';
-import { createRandom } from './random.js';
-import {
-  createWorld,
-  EVENT_SHOOT,
-  EVENT_HIT,
-  EVENT_KILL,
-  EVENT_PICKUP,
-  EVENT_LEVELUP,
-  EVENT_WAVE_CLEAR,
-  EVENT_HURT,
-  EVENT_OVER,
-  EVENT_WAVE_START,
-  EVENT_DASH,
-  EVENT_NOVA,
-  EVENT_BOSS,
-  EVENT_STREAK,
-} from './world.js';
-import {
-  ACTION_CONFIRM,
-  ACTION_PAUSE,
-  ACTION_MUTE,
-  ACTION_RESTART,
-  ACTION_DASH,
-  createInput,
-} from './input.js';
-import {
-  createRenderer,
-  SCREEN_TITLE,
-  SCREEN_PLAY,
-  SCREEN_LEVELUP,
-  SCREEN_PAUSED,
-  SCREEN_OVER,
-} from './render.js';
-import { createAudio } from './audio.js';
+// EMBERFALL v3 — boot + fixed-step loop + screen state machine.
+//
+// The loop runs the world at a fixed 1/60s step (accumulator, spiral-of-death
+// capped), renders every animation frame, and owns the juice that lives
+// outside the sim: trauma-based shake and hit-stop. Screens: title, play,
+// levelup, relic, pause, over. `?shot=<name>&seed=<n>` stages a screenshot
+// scene instead of starting the title screen.
+//
+// Exposes window.__emberfall = { world, screen } for debugging and for the
+// screenshot harness to confirm the scene staged.
+
+import { FIELD, STEP, BEST_KEY, PROFILE_KEY } from './config.js';
+import { createRandom } from './rng.js';
+import { createWorld, EVENTS } from './world.js';
+import { createRenderer, SCREEN_TITLE, SCREEN_PLAY, SCREEN_LEVELUP, SCREEN_RELIC, SCREEN_PAUSE, SCREEN_OVER } from './render.js';
+import { createInput } from './input.js';
 import { stageShot } from './shots.js';
-
-const MAX_FRAME = 0.25;
-const FIELD_WIDTH = 1280;
-const FIELD_HEIGHT = 720;
-
-const params = new URLSearchParams(window.location.search);
-const shotName = params.get('shot');
-const seedParam = params.get('seed');
-const seedValue = seedParam !== null && seedParam !== '' && Number.isFinite(Number(seedParam))
-  ? Number(seedParam) >>> 0
-  : null;
+import { audio } from './audio.js';
 
 const canvas = document.getElementById('game');
-const statusEl = document.getElementById('status');
+canvas.width = FIELD.width;
+canvas.height = FIELD.height;
 
-function announce(text) {
-  if (statusEl) statusEl.textContent = text;
-}
+const params = new URLSearchParams(location.search);
+const shotName = params.get('shot');
+const seedParam = Number(params.get('seed') || '1');
+const seed = Number.isFinite(seedParam) ? seedParam : 1;
 
-function loadBest() {
+const world = createWorld(createRandom(seed));
+const renderer = createRenderer(canvas);
+const input = createInput(canvas);
+input.onFirstInteract(() => audio.unlock());
+
+let screen = SCREEN_TITLE;
+let trauma = 0;
+let hitStopT = 0; // real seconds left of slow motion
+let timeScale = 1;
+let last = performance.now();
+let acc = 0;
+let viewTime = 0;
+let muted = false;
+let best = 0;
+let profile = { runs: 0, kills: 0, bestWave: 0 };
+try {
+  best = Number(localStorage.getItem(BEST_KEY) || '0') || 0;
+  profile = JSON.parse(localStorage.getItem(PROFILE_KEY) || 'null') || profile;
+} catch (e) { /* private mode: play without persistence */ }
+
+const today = new Date();
+const dailySeed = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, '0')}${String(today.getDate()).padStart(2, '0')}`;
+
+function saveProfile() {
   try {
-    const raw = window.localStorage.getItem(BEST_KEY);
-    const value = raw === null ? 0 : Number(raw);
-    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
-  } catch (_err) {
-    return 0;
-  }
+    localStorage.setItem(BEST_KEY, String(best));
+    localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
+  } catch (e) { /* ignore */ }
 }
 
-function saveBest(score) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(score));
-  } catch (_err) {
-    // Storage unavailable (private mode, blocked cookies, ...): best score
-    // simply does not persist. The game keeps running.
-  }
+function startRun() {
+  world.reset();
+  screen = SCREEN_PLAY;
+  trauma = 0;
+  profile.runs++;
+  audio.unlock();
+  audio.click();
 }
 
-/** Build the per-frame world input from the live input device. */
-function liveInput(input, world, dashQueued) {
-  const mv = input.move();
-  const aim = input.aim();
+function endRunIfOver() {
+  if (!world.state.over) return;
+  if (world.state.score > best) best = world.state.score;
+  profile.kills += world.state.kills;
+  profile.bestWave = Math.max(profile.bestWave, world.state.wave);
+  saveProfile();
+  screen = SCREEN_OVER;
+}
+
+// Map one step's events to sound + juice.
+function handleEvents(events) {
+  if (events & EVENTS.HURT) { audio.hurt(); addTrauma(0.45); }
+  if (events & EVENTS.KILL) { audio.kill(); addTrauma(0.08); }
+  if (events & EVENTS.CRIT) { audio.crit(); addTrauma(0.14); }
+  if (events & EVENTS.DASH) { audio.dash(); }
+  if (events & EVENTS.NOVA) { audio.nova(); addTrauma(0.3); }
+  if (events & EVENTS.LEVELUP) { audio.levelup(); }
+  if (events & EVENTS.WAVECLEAR) { audio.waveclear(); }
+  if (events & EVENTS.BOSS) { audio.boss(); addTrauma(0.5); }
+  if (events & EVENTS.BOSSKILL) { audio.bosskill(); addTrauma(1); hitStop(0.14); }
+  if (events & EVENTS.STREAK) { audio.streak(); }
+  if (events & EVENTS.EVOLVE) { audio.evolve(); addTrauma(0.5); hitStop(0.1); }
+  if (events & EVENTS.SHRINE) { audio.shrine(); }
+  if (events & EVENTS.STORM) { audio.storm(); }
+  if (events & EVENTS.RELIC) { audio.relic(); }
+  if (events & EVENTS.REVIVE) { audio.revive(); addTrauma(0.8); hitStop(0.16); }
+  if (events & EVENTS.STUN) { audio.stun(); }
+  if (events & EVENTS.ELITEKILL) { audio.streak(); }
+}
+
+function addTrauma(amount) {
+  trauma = Math.min(1, trauma + amount);
+}
+
+function hitStop(seconds) {
+  hitStopT = Math.max(hitStopT, seconds);
+}
+
+function buildInput() {
+  const mv = input.moveVector();
   const p = world.state.player;
-  const dx = aim.x - p.x;
-  const dy = aim.y - p.y;
-  const len = Math.hypot(dx, dy) || 1;
+  // Aim: mouse position in logical coords, relative to the keeper.
+  const ax = input.mouseX - p.x;
+  const ay = input.mouseY - p.y;
+  const al = Math.hypot(ax, ay) || 1;
   return {
     mx: mv.x, my: mv.y,
-    ax: dx / len, ay: dy / len,
+    ax: ax / al, ay: ay / al,
     firing: input.firing(),
-    dash: dashQueued || input.dashing(),
+    dash: input.takeDash(),
   };
 }
 
-const IDLE_INPUT = { mx: 0, my: 0, ax: 1, ay: 0, firing: false, dash: false };
-
-/** Play the sounds that match a step() event bitmask. */
-function playEvents(audio, events, combo) {
-  if (events & EVENT_SHOOT) audio.shoot();
-  if (events & EVENT_HIT) audio.hit();
-  if (events & EVENT_KILL) audio.kill();
-  if (events & EVENT_PICKUP) audio.pickup(combo);
-  if (events & EVENT_LEVELUP) audio.levelup();
-  if (events & EVENT_WAVE_CLEAR) audio.waveClear();
-  if (events & EVENT_HURT) audio.hurt();
-  if (events & EVENT_OVER) audio.gameOver();
-  if (events & EVENT_WAVE_START) audio.click();
-  if (events & EVENT_DASH) audio.dash();
-  if (events & EVENT_NOVA) audio.nova();
-  if (events & EVENT_BOSS) audio.boss();
-  if (events & EVENT_STREAK) audio.streak();
+function chooseFromClick(click, cards) {
+  // Cards are drawn by render.js: 300 wide, 210 tall, starting at y=210,
+  // centred with a 26px gap. Mirror that layout here for hit-testing.
+  const w = 300;
+  const h = 210;
+  const gap = 26;
+  const total = cards.length * w + (cards.length - 1) * gap;
+  let x = 640 - total / 2;
+  const y = 210;
+  for (let i = 0; i < cards.length; i++) {
+    if (click.x >= x && click.x <= x + w && click.y >= y && click.y <= y + h) return i;
+    x += w + gap;
+  }
+  return -1;
 }
 
-/**
- * Screenshot mode: stage the named scene, paint it twice via
- * requestAnimationFrame so the canvas is fully settled, then signal the
- * harness with window.__shotReady.
- */
-function runShot(name) {
-  const seed = seedValue === null ? 1 : seedValue;
-  const world = createWorld(createRandom(seed));
-  const renderer = createRenderer(canvas);
-  const staged = stageShot(name, world);
-  const screen = staged && staged.screen ? staged.screen : SCREEN_TITLE;
-  const best = staged && typeof staged.best === 'number' ? staged.best : 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  let dt = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  viewTime += dt;
+  // Hit-stop runs on real time so it always ends.
+  if (hitStopT > 0) {
+    hitStopT -= dt;
+    timeScale = 0.25;
+  } else {
+    timeScale = 1;
+  }
+  trauma = Math.max(0, trauma - 1.2 * dt);
 
-  announce('Emberfall screenshot: ' + name + '.');
-  // Paint ~20 frames so the v2 fade-in transition fully settles before the
-  // harness captures; two frames would leave the shot dimmed by the fade.
-  let frames = 0;
-  function paint() {
-    renderer.draw(world.state, screen, best);
-    frames += 1;
-    if (frames < 20) {
-      window.requestAnimationFrame(paint);
+  const key = input.takeKey();
+  const click = input.takeClick();
+
+  if (screen === SCREEN_TITLE) {
+    if (key === 'enter' || click) startRun();
+  } else if (screen === SCREEN_PLAY) {
+    if (key === 'p' || key === 'escape') {
+      screen = SCREEN_PAUSE;
+      audio.click();
+    } else if (key === 'm') {
+      muted = !muted;
+      audio.setMuted(muted);
+    } else if (key === 'r') {
+      startRun();
     } else {
-      window.__shotReady = true;
-    }
-  }
-  window.requestAnimationFrame(paint);
-}
-
-/** Normal interactive game: fixed-step loop + screen state machine. */
-function runGame() {
-  const seed = seedValue === null
-    ? (Math.random() * 0x7fffffff) | 0
-    : seedValue;
-  const world = createWorld(createRandom(seed));
-  const input = createInput(canvas);
-  const renderer = createRenderer(canvas);
-  const audio = createAudio();
-
-  let best = loadBest();
-  let screen = SCREEN_TITLE;
-  let audioReady = false;
-  // One-shot dash requests queue here between frames so a tap is never lost.
-  let dashQueued = false;
-
-  function ensureAudio() {
-    if (!audioReady) {
-      audio.ensure();
-      audioReady = true;
-    }
-  }
-
-  // First user gesture unlocks WebAudio (autoplay policy).
-  window.addEventListener('pointerdown', ensureAudio, { once: false });
-  window.addEventListener('keydown', ensureAudio, { once: false });
-
-  function setScreen(next, announcement) {
-    if (next === screen) return;
-    screen = next;
-    if (announcement) announce(announcement);
-  }
-
-  function startRun() {
-    world.reset();
-    setScreen(
-      SCREEN_PLAY,
-      'Emberfall started. Wave 1. Move with WASD, aim with the mouse, hold click or Space to fire, Shift to dash.',
-    );
-  }
-
-  function restartRun() {
-    world.reset();
-    setScreen(
-      SCREEN_PLAY,
-      'Emberfall restarted. Wave 1. Move with WASD, aim with the mouse, hold click or Space to fire, Shift to dash.',
-    );
-  }
-
-  function pickUpgrade(index) {
-    if (!world.state.levelUpPending) return;
-    if (index < 0 || index >= world.state.choices.length) return;
-    world.chooseUpgrade(index);
-    audio.click();
-    setScreen(SCREEN_PLAY, 'Upgrade chosen. Wave ' + world.state.wave + '.');
-  }
-
-  function handleActions(actions, click) {
-    if (actions & ACTION_MUTE) {
-      audio.setMuted(!audio.isMuted());
-    }
-    if (actions & ACTION_DASH) {
-      dashQueued = true;
-    }
-
-    if (screen === SCREEN_TITLE) {
-      if (actions & ACTION_CONFIRM || click) {
-        ensureAudio();
-        audio.click();
-        startRun();
-      }
-      return;
-    }
-
-    if (screen === SCREEN_OVER) {
-      if (actions & ACTION_RESTART || actions & ACTION_CONFIRM || click) {
-        ensureAudio();
-        audio.click();
-        restartRun();
-      }
-      return;
-    }
-
-    if (screen === SCREEN_PAUSED) {
-      if (actions & ACTION_PAUSE || actions & ACTION_CONFIRM) {
-        setScreen(SCREEN_PLAY, 'Resumed. Wave ' + world.state.wave + '.');
-      } else if (actions & ACTION_RESTART) {
-        restartRun();
-      }
-      return;
-    }
-
-    if (screen === SCREEN_LEVELUP) {
-      // Clicks land on cards; digits pick by number. Pause is ignored here
-      // so a stray P cannot hide the choice.
-      if (click) {
-        const rects = renderer.cardRects();
-        for (let i = 0; i < rects.length; i += 1) {
-          const r = rects[i];
-          if (click.x >= r.x && click.x <= r.x + r.w
-            && click.y >= r.y && click.y <= r.y + r.h) {
-            pickUpgrade(i);
-            return;
-          }
+      acc += dt * timeScale;
+      let guard = 0;
+      while (acc >= STEP && guard++ < 5) {
+        acc -= STEP;
+        const events = world.step(STEP, buildInput());
+        handleEvents(events);
+        if (world.state.levelUpPending) {
+          screen = SCREEN_LEVELUP;
+          audio.levelup();
+          break;
+        }
+        if (world.state.relicPending) {
+          screen = SCREEN_RELIC;
+          audio.relic();
+          break;
+        }
+        if (world.state.over) {
+          endRunIfOver();
+          break;
         }
       }
-      return;
+      if (acc > STEP * 5) acc = 0; // drop backlog, never spiral
     }
-
-    // SCREEN_PLAY
-    if (actions & ACTION_PAUSE) {
-      setScreen(SCREEN_PAUSED, 'Paused. Press P or Escape to resume, R to restart.');
+  } else if (screen === SCREEN_LEVELUP) {
+    let pick = -1;
+    if (key === '1' || key === '2' || key === '3') pick = Number(key) - 1;
+    if (click) pick = chooseFromClick(click, world.state.choices);
+    if (pick >= 0 && pick < world.state.choices.length) {
+      world.chooseUpgrade(pick);
+      audio.click();
+      screen = world.state.relicPending ? SCREEN_RELIC : SCREEN_PLAY;
     }
+  } else if (screen === SCREEN_RELIC) {
+    let pick = -1;
+    if (key === '1' || key === '2' || key === '3') pick = Number(key) - 1;
+    if (click) pick = chooseFromClick(click, world.state.relicChoices);
+    if (pick >= 0 && pick < world.state.relicChoices.length) {
+      world.chooseRelic(pick);
+      audio.click();
+      screen = SCREEN_PLAY;
+    }
+  } else if (screen === SCREEN_PAUSE) {
+    if (key === 'p' || key === 'escape') screen = SCREEN_PLAY;
+    else if (key === 'r') startRun();
+    else if (key === 'm') {
+      muted = !muted;
+      audio.setMuted(muted);
+    }
+  } else if (screen === SCREEN_OVER) {
+    if (key === 'r' || click) startRun();
   }
 
-  // Leaving the tab mid-run pauses instead of letting the world run on
-  // (and the player die) while nobody is watching.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      setScreen(SCREEN_PAUSED, 'Paused. Press P or Escape to resume, R to restart.');
-    }
+  renderer.draw(world.state, screen, {
+    dt, time: viewTime, trauma, muted, best, profile, dailySeed,
   });
-
-  announce(
-    'Emberfall title screen. Press Space or click to begin. Best score ' + best + '.',
-  );
-
-  let last = performance.now();
-  let accumulator = 0;
-
-  function frame(now) {
-    window.requestAnimationFrame(frame);
-    let dt = (now - last) / 1000;
-    last = now;
-    if (!(dt > 0)) dt = 0;
-    if (dt > MAX_FRAME) dt = MAX_FRAME;
-    accumulator += dt;
-
-    // Drain one-shot input once per frame, before stepping.
-    const actions = input.takeActions();
-    const click = input.takeClick();
-    const digit = input.takeDigit();
-    if (actions || click || digit) ensureAudio();
-
-    if (screen === SCREEN_LEVELUP && digit >= 1 && digit <= 3) {
-      pickUpgrade(digit - 1);
-    }
-
-    handleActions(actions, click);
-
-    let steps = 0;
-    while (accumulator >= STEP && steps < 5) {
-      accumulator -= STEP;
-      steps += 1;
-
-      if (screen === SCREEN_TITLE) {
-        world.step(STEP, IDLE_INPUT, true);
-      } else if (screen === SCREEN_PLAY) {
-        const events = world.step(STEP, liveInput(input, world, dashQueued), false);
-        // The dash request is consumed by the first step of the frame.
-        dashQueued = false;
-        playEvents(audio, events, world.state.combo);
-        if (events & EVENT_BOSS) {
-          announce('The Gloomlord awakens — wave ' + world.state.wave + '.');
-        }
-        if (events & EVENT_LEVELUP) {
-          setScreen(
-            SCREEN_LEVELUP,
-            'Level up! Choose one of three upgrades: press 1, 2 or 3, or click a card.',
-          );
-        } else if (events & EVENT_OVER) {
-          if (world.state.score > best) {
-            best = world.state.score;
-            saveBest(best);
-          }
-          setScreen(
-            SCREEN_OVER,
-            'Game over. Score ' + world.state.score
-              + ', wave ' + world.state.wave
-              + ', ' + world.state.kills + ' kills. Best ' + best
-              + '. Press R or Space to play again.',
-          );
-        }
-      }
-      // PAUSED / LEVELUP / OVER: the world is frozen; only the renderer runs.
-    }
-    if (steps === 5) accumulator = 0;
-
-    renderer.draw(world.state, screen, best);
-  }
-
-  window.requestAnimationFrame(frame);
 }
 
 if (shotName) {
-  runShot(shotName);
+  // Screenshot mode: stage the scene, render it, and sit still.
+  screen = stageShot(shotName, world);
+  // Paint several frames so fades/particles settle before the capture.
+  for (let i = 0; i < 20; i++) {
+    renderer.draw(world.state, screen, {
+      dt: STEP, time: i * STEP, trauma: 0, muted: true, best, profile, dailySeed,
+    });
+  }
+  window.__emberfall = { world, screen };
+  window.__emberfallReady = true;
 } else {
-  runGame();
+  window.__emberfall = { world, screen: () => screen };
+  requestAnimationFrame(frame);
 }
